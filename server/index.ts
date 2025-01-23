@@ -130,7 +130,7 @@ class SketchManager {
 	private writerMutex = new Mutex();
 	private sketchesDir: string;
 
-	constructor(sketchesDir = './sketches') {
+	constructor(sketchesDir = './conversations') {
 		this.sketchesDir = sketchesDir;
 		try {
 			Bun.$`mkdir -p ${sketchesDir}`.quiet();
