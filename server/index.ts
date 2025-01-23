@@ -3,17 +3,9 @@ import { Database } from 'bun:sqlite';
 import { and, asc, eq, max, sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/bun-sqlite';
 import * as schema from './schema';
-// Remove the existing initializeDatabase function and replace with:
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
+import type { FileSink, ServerWebSocket } from 'bun';
 
-function safeJsonParse(str: string): any | null {
-	try {
-		return JSON.parse(str);
-	} catch (error) {
-		console.error('JSON parse error:', error);
-		return null;
-	}
-}
 // Type definitions
 export interface ChatConversation {
 	uuid: string;
@@ -130,6 +122,254 @@ export enum StopReason {
 	StopSequence = 'stop_sequence',
 }
 
+class SketchManager {
+	private sketchWriters = new Map<string, FileSink>();
+	private fileContents = new Map<string, string>();
+	private blockPositions = new Map<string, Map<number, [number, number]>>();
+	private messageIndices = new Map<string, Map<string, number>>();
+	private writerMutex = new Mutex();
+	private sketchesDir: string;
+
+	constructor(sketchesDir = './sketches') {
+		this.sketchesDir = sketchesDir;
+		try {
+			Bun.$`mkdir -p ${sketchesDir}`.quiet();
+		} catch (error) {
+			console.log('Sketches directory already exists');
+		}
+	}
+
+	// Add these methods to the SketchManager class
+	async writeMessageCompletion(conversationUUID: string, messageId: string) {
+		const content = `\n<!-- MESSAGE COMPLETE: ${messageId} -->\n`;
+		await this.writeContentBlock(conversationUUID, {
+			index: -1, // Special index for message completion markers
+			type: ContentType.Text,
+			content: content,
+		});
+	}
+	async writeBlockHeader(
+		conversationUUID: string,
+		blockIndex: number,
+		type: ContentType,
+		toolUseId?: string
+	) {
+		const writer = await this.getWriter(conversationUUID);
+		let header = `\n<!-- ${type.toUpperCase()} BLOCK ${blockIndex}`;
+		if (toolUseId) {
+			header += ` ID: ${toolUseId}`;
+		}
+		header += ' -->\n';
+		await writer.write(header);
+		this.updateCachedContent(conversationUUID, header);
+		this.updateBlockPosition(conversationUUID, blockIndex, header);
+	}
+
+	async writeDeltaContent(
+		conversationUUID: string,
+		blockIndex: number,
+		content: string
+	) {
+		const writer = await this.getWriter(conversationUUID);
+		await writer.write(content);
+		this.updateCachedContent(conversationUUID, content);
+		this.extendBlockPosition(conversationUUID, blockIndex, content);
+	}
+
+	private extendBlockPosition(
+		conversationUUID: string,
+		blockIndex: number,
+		content: string
+	) {
+		const currentBlocks =
+			this.blockPositions.get(conversationUUID) || new Map();
+		const blockPos = currentBlocks.get(blockIndex);
+		const addedLines = content.split('\n').length;
+
+		if (blockPos) {
+			currentBlocks.set(blockIndex, [
+				blockPos[0],
+				blockPos[1] + addedLines,
+			]);
+		} else {
+			const currentLineCount =
+				this.fileContents.get(conversationUUID)?.split('\n').length ||
+				0;
+			currentBlocks.set(blockIndex, [
+				currentLineCount,
+				currentLineCount + addedLines,
+			]);
+		}
+
+		this.blockPositions.set(conversationUUID, currentBlocks);
+	}
+
+	async getWriter(conversationUUID: string): Promise<FileSink> {
+		const release = await this.writerMutex.acquire();
+		try {
+			if (!this.sketchWriters.has(conversationUUID)) {
+				await this.initializeWriter(conversationUUID);
+			}
+			return this.sketchWriters.get(conversationUUID)!;
+		} finally {
+			release();
+		}
+	}
+
+	private async initializeWriter(conversationUUID: string) {
+		const filePath = `${this.sketchesDir}/${conversationUUID}.md`;
+		let existingContent = '';
+
+		try {
+			existingContent = await Bun.file(filePath).text();
+			this.parseExistingContent(conversationUUID, existingContent);
+		} catch (error) {
+			console.log('Creating new sketch file for', conversationUUID);
+		}
+
+		const writer = Bun.file(filePath).writer();
+		writer.write(existingContent);
+		this.sketchWriters.set(conversationUUID, writer);
+		this.fileContents.set(conversationUUID, existingContent);
+	}
+
+	private parseExistingContent(conversationUUID: string, content: string) {
+		const messageMap = new Map<string, number>();
+		const blockMap = new Map<number, [number, number]>();
+
+		const lines = content.split('\n');
+		let currentMessageId: string | null = null;
+		let blockStart = -1;
+
+		lines.forEach((line, index) => {
+			const messageMatch = line.match(/<!-- MESSAGE UUID: (\S+) -->/);
+			if (messageMatch) {
+				currentMessageId = messageMatch[1];
+				messageMap.set(currentMessageId, index);
+			}
+
+			const blockMatch = line.match(/<!-- (\w+) BLOCK (\d+)/);
+			if (blockMatch) {
+				blockStart = index;
+			}
+
+			if (line.includes('-->') && blockStart !== -1) {
+				const blockIndex = Number.parseInt(blockMatch![2], 10);
+				blockMap.set(blockIndex, [blockStart, index]);
+				blockStart = -1;
+			}
+		});
+
+		this.messageIndices.set(conversationUUID, messageMap);
+		this.blockPositions.set(conversationUUID, blockMap);
+	}
+
+	async writeMessageStart(conversationUUID: string, messageUUID: string) {
+		const writer = await this.getWriter(conversationUUID);
+		const header = `\n<!-- MESSAGE UUID: ${messageUUID} -->\n`;
+		await writer.write(header);
+		this.updateCachedContent(conversationUUID, header);
+	}
+
+	async writeContentBlock(
+		conversationUUID: string,
+		block: {
+			index: number;
+			type: ContentType;
+			toolUseId?: string;
+			content: string;
+		}
+	) {
+		const writer = await this.getWriter(conversationUUID);
+		let blockHeader = `\n<!-- ${block.type.toUpperCase()} BLOCK ${
+			block.index
+		}`;
+
+		if (block.toolUseId) {
+			blockHeader += ` ID: ${block.toolUseId}`;
+		}
+
+		blockHeader += ' -->\n';
+		const fullContent = `${blockHeader + block.content}\n`;
+
+		await writer.write(fullContent);
+		this.updateCachedContent(conversationUUID, fullContent);
+		this.updateBlockPosition(conversationUUID, block.index, fullContent);
+	}
+
+	private updateCachedContent(conversationUUID: string, content: string) {
+		const currentContent = this.fileContents.get(conversationUUID) || '';
+		this.fileContents.set(conversationUUID, currentContent + content);
+	}
+
+	private updateBlockPosition(
+		conversationUUID: string,
+		blockIndex: number,
+		content: string
+	) {
+		const lines = content.split('\n').length;
+		const currentBlocks =
+			this.blockPositions.get(conversationUUID) || new Map();
+		const startLine =
+			this.fileContents.get(conversationUUID)?.split('\n').length || 0;
+		currentBlocks.set(blockIndex, [startLine, startLine + lines]);
+		this.blockPositions.set(conversationUUID, currentBlocks);
+	}
+
+	async updateContentBlock(
+		conversationUUID: string,
+		blockIndex: number,
+		newContent: string
+	) {
+		const release = await this.writerMutex.acquire();
+		try {
+			const writer = await this.getWriter(conversationUUID);
+			const currentContent =
+				this.fileContents.get(conversationUUID) || '';
+			const blockPos = this.blockPositions
+				.get(conversationUUID)
+				?.get(blockIndex);
+
+			if (!blockPos) {
+				throw new Error(
+					`Block ${blockIndex} not found for ${conversationUUID}`
+				);
+			}
+
+			const lines = currentContent.split('\n');
+			const newLines = [
+				...lines.slice(0, blockPos[0]),
+				`<!-- REPLACING BLOCK ${blockIndex} -->`,
+				newContent,
+				...lines.slice(blockPos[1]),
+			];
+
+			const newContentStr = newLines.join('\n');
+			await writer.write(newContentStr);
+			this.fileContents.set(conversationUUID, newContentStr);
+			this.parseExistingContent(conversationUUID, newContentStr);
+		} finally {
+			release();
+		}
+	}
+
+	async closeWriter(conversationUUID: string) {
+		const release = await this.writerMutex.acquire();
+		try {
+			const writer = this.sketchWriters.get(conversationUUID);
+			if (writer) {
+				await writer.end();
+				this.sketchWriters.delete(conversationUUID);
+				this.fileContents.delete(conversationUUID);
+				this.blockPositions.delete(conversationUUID);
+				this.messageIndices.delete(conversationUUID);
+			}
+		} finally {
+			release();
+		}
+	}
+}
+
 interface ContentBlockTracker {
 	index: number;
 	type: ContentType;
@@ -159,6 +399,14 @@ interface ContentBlockTracker {
 	>;
 }
 
+interface ClientConnection {
+	ws: ServerWebSocket<WebSocketData>;
+	activeConversation: string | null;
+	clientId: string;
+}
+
+const clients = new Map<string, ClientConnection>();
+
 interface ContentBlock {
 	index: number;
 	content: string;
@@ -176,13 +424,35 @@ interface WebSocketData {
 		created_at: string;
 		currentBlockIndex: number;
 		activeCodeBlock: boolean;
-		blockTracker: ContentBlockTracker; // New tracking system
+		blockTracker: ContentBlockTracker;
 	} | null;
 	activeConversation: string | null;
+	clientId: string;
+}
+
+// Helper function to broadcast to conversation participants
+function broadcastToConversation(conversationUUID: string, message: any) {
+	for (const client of clients.values()) {
+		if (
+			client.activeConversation === conversationUUID &&
+			client.ws.readyState === WebSocket.OPEN
+		) {
+			client.ws.send(JSON.stringify(message));
+		}
+	}
 }
 
 // Constants and initialization
 const sketchPath = './sketch.md';
+const sketchManager = new SketchManager();
+const sketchWriters = sketchManager;
+const sketchesDir = './sketches';
+// Ensure sketches directory exists
+try {
+	await Bun.$`mkdir -p ${sketchesDir}`.quiet();
+} catch (error) {
+	console.log('Sketches directory already exists');
+}
 const sqlite = new Database('claude.db', {
 	create: true,
 });
@@ -193,8 +463,6 @@ const db = drizzle(sqlite, { schema });
 migrate(db, { migrationsFolder: './drizzle' });
 
 const messageMutex = new Mutex();
-let sketchWriter = Bun.file(sketchPath).writer();
-await sketchWriter.write('# Live Message Sketch\n\n');
 
 interface ToolRelationship {
 	toolUseId: string;
@@ -321,10 +589,23 @@ Bun.serve<WebSocketData>({
 	},
 	websocket: {
 		async open(ws) {
+			const clientId = crypto.randomUUID();
 			ws.data = {
 				currentMessage: null,
 				activeConversation: null,
+				clientId,
 			};
+
+			// Add to clients map
+			clients.set(clientId, {
+				ws,
+				activeConversation: null,
+				clientId,
+			});
+		},
+		async close(ws) {
+			// Remove from clients map
+			clients.delete(ws.data.clientId);
 		},
 
 		async message(ws, raw) {
@@ -333,8 +614,8 @@ Bun.serve<WebSocketData>({
 				type: string;
 				data: any;
 				conversation_uuid: string;
-				endpoint: string; // Add this
-				url: string; // Add this
+				endpoint: string;
+				url: string;
 			};
 
 			const { type, data, conversation_uuid, endpoint, url } = payload;
@@ -351,6 +632,11 @@ Bun.serve<WebSocketData>({
 							.where(
 								eq(schema.conversations.uuid, conversation_uuid)
 							);
+						// Broadcast title change to all conversation participants
+						broadcastToConversation(conversation_uuid, {
+							type: 'conversation_title_updated',
+							title: data.title,
+						});
 						break;
 					case 'conversations_list':
 						console.log(
@@ -361,17 +647,29 @@ Bun.serve<WebSocketData>({
 						await handleConversationData(conversation_uuid, data);
 						break;
 
-					case 'conversation_detail':
+					case 'conversation_detail': {
 						console.log(
 							'[DEBUG] Handling conversation_detail:',
 							data.uuid
 						);
 						await handleConversationData(conversation_uuid, [data]);
 						ws.data.activeConversation = data.uuid;
+						// Update client tracking
+						const client = clients.get(ws.data.clientId);
+						if (client) {
+							client.activeConversation = data.uuid;
+							clients.set(ws.data.clientId, client);
+						}
 						break;
+					}
 
 					case 'message_start': {
 						// Initialize new message tracking
+						// Get or create sketch writer for this conversation
+						await sketchManager.writeMessageStart(
+							conversation_uuid,
+							data.message.uuid
+						);
 						ws.data.currentMessage = {
 							id: data.message.uuid,
 							conversation_uuid: conversation_uuid,
@@ -399,9 +697,7 @@ Bun.serve<WebSocketData>({
 							created_at: now,
 							updated_at: now,
 						});
-						await sketchWriter.write(
-							`<!-- MESSAGE UUID: ${data.message.uuid} -->\n`
-						);
+
 						break;
 					}
 
@@ -433,6 +729,7 @@ Bun.serve<WebSocketData>({
 
 					case 'content_block_start': {
 						if (!ws.data.currentMessage?.blockTracker) break;
+
 						const tracker = ws.data.currentMessage.blockTracker;
 						const blockIndex = data.index;
 
@@ -454,12 +751,10 @@ Bun.serve<WebSocketData>({
 
 						// Handle block replacements
 						if (tracker.currentBlocks.has(blockIndex)) {
-							const oldBlock =
-								tracker.currentBlocks.get(blockIndex)!;
-							oldBlock.status = 'invalid';
-							oldBlock.replacedBy = blockIndex;
-							await sketchWriter.write(
-								`\n<!-- REPLACING BLOCK ${blockIndex} -->\n`
+							await sketchManager.updateContentBlock(
+								conversation_uuid,
+								blockIndex,
+								`<!-- REPLACED BLOCK ${blockIndex} -->`
 							);
 						}
 
@@ -490,16 +785,13 @@ Bun.serve<WebSocketData>({
 							});
 						}
 
-						// Write block header
-						let blockComment = `\n<!-- ${newBlock.type.toUpperCase()} BLOCK ${blockIndex}`;
-						if (
-							newBlock.type === ContentType.ToolUse &&
+						await sketchManager.writeBlockHeader(
+							conversation_uuid,
+							blockIndex,
+							newBlock.type,
 							newBlock.toolUseId
-						) {
-							blockComment += ` ID: ${newBlock.toolUseId}`;
-						}
-						blockComment += ' -->\n';
-						await sketchWriter.write(blockComment);
+						);
+
 						break;
 					}
 
@@ -529,7 +821,11 @@ Bun.serve<WebSocketData>({
 							});
 							block.fragments.push(data.delta.text);
 							block.textContent += data.delta.text;
-							await sketchWriter.write(data.delta.text);
+							await sketchManager.writeDeltaContent(
+								conversation_uuid,
+								data.index,
+								data.delta.text
+							);
 						}
 
 						if (data.delta?.partial_json) {
@@ -548,13 +844,18 @@ Bun.serve<WebSocketData>({
 									relationship.status = 'pending';
 								}
 							}
-							await sketchWriter.write(data.delta.partial_json);
+							await sketchManager.writeDeltaContent(
+								conversation_uuid,
+								data.index,
+								data.delta.partial_json
+							);
 						}
 						break;
 					}
 
 					case 'content_block_stop': {
 						if (!ws.data.currentMessage) break;
+
 						const blockIndex = data.index;
 						const block =
 							ws.data.currentMessage.blockTracker.currentBlocks.get(
@@ -618,11 +919,15 @@ Bun.serve<WebSocketData>({
 									});
 								});
 
-								await sketchWriter.write(
+								await sketchManager.writeDeltaContent(
+									conversation_uuid,
+									blockIndex,
 									`\n\`\`\`${parsed.language}\n${parsed.content}\n\`\`\`\n`
 								);
 							} catch (error) {
-								await sketchWriter.write(
+								await sketchManager.writeDeltaContent(
+									conversation_uuid,
+									blockIndex,
 									`\n<!-- INVALID TOOL USE BLOCK ${blockIndex} -->\n`
 								);
 
@@ -691,6 +996,8 @@ Bun.serve<WebSocketData>({
 
 					case 'message_stop': {
 						if (!ws.data.currentMessage) break;
+						const conversationUUID =
+							ws.data.currentMessage.conversation_uuid;
 
 						// Finalize all blocks and relationships
 						await db.transaction(async (tx) => {
@@ -772,16 +1079,37 @@ Bun.serve<WebSocketData>({
 						});
 
 						// Finalize sketch file
-						await sketchWriter.write(
-							`\n<!-- MESSAGE COMPLETE: ${ws.data.currentMessage.id} -->\n`
+						await sketchManager.writeMessageCompletion(
+							conversationUUID,
+							ws.data.currentMessage.id
 						);
+
+						broadcastToConversation(conversationUUID, {
+							type: 'message_completed',
+							messageId: ws.data.currentMessage!.id,
+						});
+
 						// await sketchWriter.end();
 						ws.data.currentMessage = null;
+						// Broadcast message completion
+
 						break;
 					}
 
 					case 'message_limit':
 						if (ws.data.currentMessage) {
+							const writer = await sketchManager.getWriter(
+								conversation_uuid
+							);
+							await sketchManager.writeContentBlock(
+								conversation_uuid,
+								{
+									index: -2, // Special index for timestamp
+									type: ContentType.Text,
+									content: `\n_Generated at: ${now}_\n`,
+								}
+							);
+
 							const textBlocks = Array.from(
 								ws.data.currentMessage.blockTracker.currentBlocks.values()
 							)
@@ -789,13 +1117,11 @@ Bun.serve<WebSocketData>({
 								.sort((a, b) => a.index - b.index);
 
 							for (const block of textBlocks) {
-								await sketchWriter.write(block.textContent);
+								await writer.write(block.textContent);
 							}
 
 							// Write timestamp and close
-							await sketchWriter.write(
-								`\n_Generated at: ${now}_\n`
-							);
+							await writer.write(`\n_Generated at: ${now}_\n`);
 							// await sketchWriter.end();
 
 							const fullContent: ChatMessageContent[] =
