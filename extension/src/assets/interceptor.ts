@@ -1,5 +1,3 @@
-import type { ChatConversation } from "../backend/schema";
-
 // interceptor.ts
 declare global {
 	interface Window {
@@ -17,9 +15,9 @@ window.debug$ = {
 	next: (data) =>
 		console.log(
 			`%c[Debug ${data.type}]%c ${data.message}`,
-			"color: blue; font-weight: bold",
-			"color: black",
-			data.data || ""
+			'color: blue; font-weight: bold',
+			'color: black',
+			data.data || ''
 		),
 };
 
@@ -30,24 +28,24 @@ let ws: WebSocket | null = null;
 function setupWebSocket() {
 	if (ws?.readyState === WebSocket.OPEN) return;
 
-	ws = new WebSocket("ws://localhost:3000");
+	ws = new WebSocket('ws://localhost:3000');
 
 	ws.onopen = () => {
-		window.debug$.next({ type: "WS", message: "WebSocket connected" });
+		window.debug$.next({ type: 'WS', message: 'WebSocket connected' });
 	};
 
 	ws.onerror = (error) => {
 		window.debug$.next({
-			type: "WS-ERROR",
-			message: "WebSocket error",
+			type: 'WS-ERROR',
+			message: 'WebSocket error',
 			data: error,
 		});
 	};
 
 	ws.onclose = () => {
 		window.debug$.next({
-			type: "WS",
-			message: "WebSocket closed, reconnecting...",
+			type: 'WS',
+			message: 'WebSocket closed, reconnecting...',
 		});
 		setTimeout(setupWebSocket, 1000);
 	};
@@ -57,7 +55,7 @@ function sendToWebSocket(event: any) {
 	if (ws?.readyState === WebSocket.OPEN) {
 		ws.send(JSON.stringify(event));
 		window.debug$.next({
-			type: "WS-SEND",
+			type: 'WS-SEND',
 			message: `Forwarded ${event.type}`,
 			data: event.data,
 		});
@@ -72,7 +70,7 @@ async function processStream(response: Response, url: string) {
 	const urlObj = new URL(url);
 
 	const decoder = new TextDecoder();
-	let buffer = "";
+	let buffer = '';
 
 	while (true) {
 		const { done, value } = await reader.read();
@@ -80,22 +78,22 @@ async function processStream(response: Response, url: string) {
 
 		buffer += decoder.decode(value, { stream: true });
 
-		while (buffer.includes("\n\n")) {
-			const eventEnd = buffer.indexOf("\n\n");
+		while (buffer.includes('\n\n')) {
+			const eventEnd = buffer.indexOf('\n\n');
 			const eventData = buffer.slice(0, eventEnd);
 			buffer = buffer.slice(eventEnd + 2);
 
-			let eventType = "sse_raw";
-			let data = "";
+			let eventType = 'sse_raw';
+			let data = '';
 
-			eventData.split("\n").forEach((line) => {
-				if (line.startsWith("event:")) eventType = line.slice(6).trim();
-				if (line.startsWith("data:")) data += line.slice(5).trim();
-			});
+			for (const line of eventData.split('\n')) {
+				if (line.startsWith('event:')) eventType = line.slice(6).trim();
+				if (line.startsWith('data:')) data += line.slice(5).trim();
+			}
 
-			const pathSegments = urlObj.pathname.split("/");
+			const pathSegments = urlObj.pathname.split('/');
 			const chatConversationsSegment = pathSegments.findIndex(
-				(segment) => segment === "chat_conversations"
+				(segment) => segment === 'chat_conversations'
 			);
 			const conversation_uuid = pathSegments.at(
 				chatConversationsSegment + 1
@@ -111,7 +109,7 @@ async function processStream(response: Response, url: string) {
 						url,
 					});
 				} catch (error) {
-					console.error("SSE parse error:", {
+					console.error('SSE parse error:', {
 						eventType,
 						data: data.slice(0, 100),
 					});
@@ -127,31 +125,28 @@ function initializeInterceptors() {
 
 	const originalFetch = window.fetch;
 	// Interceptor.ts - Revised fetch handler
-	window.fetch = async function (
-		input: RequestInfo | URL,
-		init?: RequestInit
-	) {
+	window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 		// Create URL object from all input types
 		const url =
 			input instanceof URL
 				? input
 				: new URL(
-						typeof input === "string" ? input : input.url,
+						typeof input === 'string' ? input : input.url,
 						window.location.origin
 				  );
 
 		// Check if it's a conversation endpoint
 		if (
-			url.pathname.includes("/api/organizations/") &&
-			url.pathname.includes("/chat_conversations")
+			url.pathname.includes('/api/organizations/') &&
+			url.pathname.includes('/chat_conversations')
 		) {
 			const response = await originalFetch(input, init);
 			const clonedResponse = response.clone();
 
 			// Handle SSE streams first
 			if (
-				url.pathname.endsWith("/completion") ||
-				url.pathname.endsWith("/retry_completion")
+				url.pathname.endsWith('/completion') ||
+				url.pathname.endsWith('/retry_completion')
 			) {
 				processStream(clonedResponse, url.href).catch(console.error);
 				return response;
@@ -159,41 +154,41 @@ function initializeInterceptors() {
 
 			// Handle JSON responses
 			try {
-				const contentType = response.headers.get("content-type");
-				if (contentType?.includes("application/json")) {
+				const contentType = response.headers.get('content-type');
+				if (contentType?.includes('application/json')) {
 					const data = await clonedResponse.json();
-					const pathSegments = url.pathname.split("/");
+					const pathSegments = url.pathname.split('/');
 
 					const chatConversationsSegment = pathSegments.findIndex(
-						(segment) => segment === "chat_conversations"
+						(segment) => segment === 'chat_conversations'
 					);
 					const conversationId = pathSegments.at(
 						chatConversationsSegment + 1
 					);
 
 					// Determine event type using URL components
-					let eventType = "conversations_list";
+					let eventType = 'conversations_list';
 					if (
-						url.pathname.includes("/chat_conversations") &&
+						url.pathname.includes('/chat_conversations') &&
 						conversationId &&
 						url.pathname.endsWith(conversationId)
 					) {
-						eventType = "conversation_detail";
-					} else if (pathSegments.at(-1) === "latest") {
-						eventType = "conversation_latest";
+						eventType = 'conversation_detail';
+					} else if (pathSegments.at(-1) === 'latest') {
+						eventType = 'conversation_latest';
 						return originalFetch(input, init);
-					} else if (pathSegments.at(-1) === "chat_message_warning") {
-						eventType = "chat_message_warning";
+					} else if (pathSegments.at(-1) === 'chat_message_warning') {
+						eventType = 'chat_message_warning';
 						return originalFetch(input, init);
-					} else if (url.pathname.endsWith("title")) {
-						eventType = "conversation_title";
+					} else if (url.pathname.endsWith('title')) {
+						eventType = 'conversation_title';
 					} else {
-						console.log("Unknown event type:", url.href);
+						console.log('Unknown event type:', url.href);
 					}
 
 					// Extract conversation UUID from path
 					const convIndex =
-						pathSegments.indexOf("chat_conversations");
+						pathSegments.indexOf('chat_conversations');
 					const conversationUUID =
 						convIndex !== -1 && convIndex < pathSegments.length - 1
 							? pathSegments[convIndex + 1]
@@ -208,7 +203,7 @@ function initializeInterceptors() {
 					});
 				}
 			} catch (error) {
-				console.error("Conversation data handling failed:", error);
+				console.error('Conversation data handling failed:', error);
 			}
 			return response;
 		}
@@ -217,7 +212,7 @@ function initializeInterceptors() {
 
 	setupWebSocket();
 	isInitialized = true;
-	window.debug$.next({ type: "INIT", message: "Interceptors ready" });
+	window.debug$.next({ type: 'INIT', message: 'Interceptors ready' });
 }
 
 // Start interception

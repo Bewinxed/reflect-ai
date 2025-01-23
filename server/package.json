@@ -10,6 +10,7 @@
     "typescript": "^5.0.0"
   },
   "dependencies": {
+    "async-mutex": "^0.5.0",
     "drizzle-orm": "^0.38.4"
   }
 }
