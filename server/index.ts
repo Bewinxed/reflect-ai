@@ -1,10 +1,16 @@
-import { Mutex } from 'async-mutex';
-import { Database } from 'bun:sqlite';
-import { and, asc, eq, max, sql } from 'drizzle-orm';
-import { drizzle } from 'drizzle-orm/bun-sqlite';
-import * as schema from './schema';
-import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
-import type { FileSink, ServerWebSocket } from 'bun';
+import { Mutex } from "async-mutex";
+import { mkdir } from "node:fs/promises";
+
+import type { SSEEvent } from "../types/claudeSSE";
+import type { ClaudeEvent } from "../types/claude";
+import type { Payload } from "../types/common";
+import { Database } from "bun:sqlite";
+import { and, asc, eq, max, sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import * as schema from "./schema";
+import { migrate } from "drizzle-orm/bun-sqlite/migrator";
+import type { FileSink, ServerWebSocket } from "bun";
+import { mkdirSync, type PathLike } from "node:fs";
 
 // Type definitions
 export interface ChatConversation {
@@ -71,7 +77,7 @@ export interface Artifact {
 	title?: string | null;
 	content: string;
 	language?: string | null;
-	status: 'draft' | 'valid' | 'invalid' | 'final';
+	status: "draft" | "valid" | "invalid" | "final";
 	tool_use_id?: string | null;
 	message_uuid?: string | null;
 	created_at?: string;
@@ -105,21 +111,78 @@ export interface Input {
 }
 
 export enum ContentType {
-	Text = 'text',
-	ToolResult = 'tool_result',
-	ToolUse = 'tool_use',
+	Text = "text",
+	ToolResult = "tool_result",
+	ToolUse = "tool_use",
 }
 
 export type Language = string;
 
-export type InputType = 'application/vnd.ant.code';
+export type InputType = "application/vnd.ant.code";
 
-export type Name = 'artifacts';
+export type Name = "artifacts";
 
-export type Sender = 'human' | 'assistant';
+export type Sender = "human" | "assistant";
 
 export enum StopReason {
-	StopSequence = 'stop_sequence',
+	StopSequence = "stop_sequence",
+}
+
+type MessageContentBlock = {
+	index: number;
+	type: ContentType;
+	content: string;
+};
+
+type ConversationMessageBlock = {
+	uuid: string;
+	position: [number, number];
+	content: MessageContentBlock;
+};
+
+class ConversationWriter {
+	private file: ReturnType<typeof Bun.file>;
+	private contents: Map<string, ConversationMessageBlock>;
+	private writer: FileSink;
+	constructor(path: PathLike) {
+		this.file = Bun.file(path.toString());
+		this.writer = this.file.writer();
+		this.contents = new Map<string, ConversationMessageBlock>();
+	}
+	async parse() {
+		const text = await this.file.text();
+		const mdCommentRegex = /^\[([^\]]+)\]: #$/gm;
+
+		const lines = text.split("\n");
+		let currentBlock: ConversationMessageBlock | null = null;
+		let blockStartLine = 0;
+
+		
+
+		lines.forEach((line, index) => {
+			const blockMatch = line.match(/<!-- (?:(?!-->).)*-->/);
+			if (blockMatch) {
+				// Start of a new block
+				if (currentBlock) {
+					// Store previous block if exists
+					blocks.set(currentBlock.uuid, {
+						...currentBlock,
+						position: [blockStartLine, index - 1],
+					});
+				}
+				const uuid = line.match(/UUID: (\S+)/)?.[1];
+				if (uuid) {
+					currentBlock = {
+						uuid,
+						position: [index, -1],
+						content: "",
+					};
+					blockStartLine = index;
+				}
+			}
+		});
+		const commentRegex = /[.*]<!-- MESSAGE UUID: (\S+) -->/;
+	}
 }
 
 class SketchManager {
@@ -130,12 +193,12 @@ class SketchManager {
 	private writerMutex = new Mutex();
 	private sketchesDir: string;
 
-	constructor(sketchesDir = './conversations') {
+	constructor(sketchesDir = "./conversations") {
 		this.sketchesDir = sketchesDir;
 		try {
-			Bun.$`mkdir -p ${sketchesDir}`.quiet();
+			mkdirSync(sketchesDir, { recursive: true });
 		} catch (error) {
-			console.log('Sketches directory already exists');
+			console.log("Sketches directory already exists");
 		}
 	}
 
@@ -159,7 +222,7 @@ class SketchManager {
 		if (toolUseId) {
 			header += ` ID: ${toolUseId}`;
 		}
-		header += ' -->\n';
+		header += " -->\n";
 		await writer.write(header);
 		this.updateCachedContent(conversationUUID, header);
 		this.updateBlockPosition(conversationUUID, blockIndex, header);
@@ -184,17 +247,13 @@ class SketchManager {
 		const currentBlocks =
 			this.blockPositions.get(conversationUUID) || new Map();
 		const blockPos = currentBlocks.get(blockIndex);
-		const addedLines = content.split('\n').length;
+		const addedLines = content.split("\n").length;
 
 		if (blockPos) {
-			currentBlocks.set(blockIndex, [
-				blockPos[0],
-				blockPos[1] + addedLines,
-			]);
+			currentBlocks.set(blockIndex, [blockPos[0], blockPos[1] + addedLines]);
 		} else {
 			const currentLineCount =
-				this.fileContents.get(conversationUUID)?.split('\n').length ||
-				0;
+				this.fileContents.get(conversationUUID)?.split("\n").length || 0;
 			currentBlocks.set(blockIndex, [
 				currentLineCount,
 				currentLineCount + addedLines,
@@ -218,13 +277,13 @@ class SketchManager {
 
 	private async initializeWriter(conversationUUID: string) {
 		const filePath = `${this.sketchesDir}/${conversationUUID}.md`;
-		let existingContent = '';
+		let existingContent = "";
 
 		try {
 			existingContent = await Bun.file(filePath).text();
 			this.parseExistingContent(conversationUUID, existingContent);
 		} catch (error) {
-			console.log('Creating new sketch file for', conversationUUID);
+			console.log("Creating new sketch file for", conversationUUID);
 		}
 
 		const writer = Bun.file(filePath).writer();
@@ -237,7 +296,7 @@ class SketchManager {
 		const messageMap = new Map<string, number>();
 		const blockMap = new Map<number, [number, number]>();
 
-		const lines = content.split('\n');
+		const lines = content.split("\n");
 		let currentMessageId: string | null = null;
 		let blockStart = -1;
 
@@ -253,7 +312,7 @@ class SketchManager {
 				blockStart = index;
 			}
 
-			if (line.includes('-->') && blockStart !== -1) {
+			if (line.includes("-->") && blockStart !== -1) {
 				const blockIndex = Number.parseInt(blockMatch![2], 10);
 				blockMap.set(blockIndex, [blockStart, index]);
 				blockStart = -1;
@@ -281,15 +340,13 @@ class SketchManager {
 		}
 	) {
 		const writer = await this.getWriter(conversationUUID);
-		let blockHeader = `\n<!-- ${block.type.toUpperCase()} BLOCK ${
-			block.index
-		}`;
+		let blockHeader = `\n<!-- ${block.type.toUpperCase()} BLOCK ${block.index}`;
 
 		if (block.toolUseId) {
 			blockHeader += ` ID: ${block.toolUseId}`;
 		}
 
-		blockHeader += ' -->\n';
+		blockHeader += " -->\n";
 		const fullContent = `${blockHeader + block.content}\n`;
 
 		await writer.write(fullContent);
@@ -298,7 +355,7 @@ class SketchManager {
 	}
 
 	private updateCachedContent(conversationUUID: string, content: string) {
-		const currentContent = this.fileContents.get(conversationUUID) || '';
+		const currentContent = this.fileContents.get(conversationUUID) || "";
 		this.fileContents.set(conversationUUID, currentContent + content);
 	}
 
@@ -307,11 +364,11 @@ class SketchManager {
 		blockIndex: number,
 		content: string
 	) {
-		const lines = content.split('\n').length;
+		const lines = content.split("\n").length;
 		const currentBlocks =
 			this.blockPositions.get(conversationUUID) || new Map();
 		const startLine =
-			this.fileContents.get(conversationUUID)?.split('\n').length || 0;
+			this.fileContents.get(conversationUUID)?.split("\n").length || 0;
 		currentBlocks.set(blockIndex, [startLine, startLine + lines]);
 		this.blockPositions.set(conversationUUID, currentBlocks);
 	}
@@ -324,8 +381,7 @@ class SketchManager {
 		const release = await this.writerMutex.acquire();
 		try {
 			const writer = await this.getWriter(conversationUUID);
-			const currentContent =
-				this.fileContents.get(conversationUUID) || '';
+			const currentContent = this.fileContents.get(conversationUUID) || "";
 			const blockPos = this.blockPositions
 				.get(conversationUUID)
 				?.get(blockIndex);
@@ -336,7 +392,7 @@ class SketchManager {
 				);
 			}
 
-			const lines = currentContent.split('\n');
+			const lines = currentContent.split("\n");
 			const newLines = [
 				...lines.slice(0, blockPos[0]),
 				`<!-- REPLACING BLOCK ${blockIndex} -->`,
@@ -344,7 +400,7 @@ class SketchManager {
 				...lines.slice(blockPos[1]),
 			];
 
-			const newContentStr = newLines.join('\n');
+			const newContentStr = newLines.join("\n");
 			await writer.write(newContentStr);
 			this.fileContents.set(conversationUUID, newContentStr);
 			this.parseExistingContent(conversationUUID, newContentStr);
@@ -384,7 +440,7 @@ interface ContentBlockTracker {
 			toolUseId?: string;
 			toolResult?: string;
 			fragments: string[];
-			status: 'pending' | 'valid' | 'invalid';
+			status: "pending" | "valid" | "invalid";
 			replacedBy?: number;
 			is_error?: boolean;
 		}
@@ -394,7 +450,7 @@ interface ContentBlockTracker {
 		{
 			toolUseIndex: number;
 			toolResultIndex?: number;
-			status: 'pending' | 'success' | 'error';
+			status: "pending" | "success" | "error";
 		}
 	>;
 }
@@ -443,32 +499,18 @@ function broadcastToConversation(conversationUUID: string, message: any) {
 }
 
 // Constants and initialization
-const sketchPath = './sketch.md';
 const sketchManager = new SketchManager();
-const sketchWriters = sketchManager;
-const sketchesDir = './sketches';
-// Ensure sketches directory exists
-try {
-	await Bun.$`mkdir -p ${sketchesDir}`.quiet();
-} catch (error) {
-	console.log('Sketches directory already exists');
-}
-const sqlite = new Database('claude.db', {
+const sketchesDir = "./conversations";
+const sqlite = new Database("claude.db", {
 	create: true,
 });
-sqlite.exec('PRAGMA foreign_keys = ON'); // Enable foreign key constraints
+sqlite.exec("PRAGMA foreign_keys = ON"); // Enable foreign key constraints
 
 const db = drizzle(sqlite, { schema });
 // Run migrations on startup
-migrate(db, { migrationsFolder: './drizzle' });
+migrate(db, { migrationsFolder: "./drizzle" });
 
 const messageMutex = new Mutex();
-
-interface ToolRelationship {
-	toolUseId: string;
-	resultIndex?: number;
-	status: 'pending' | 'success' | 'error';
-}
 
 // Enhanced conversation handler
 // Updated conversation handler with proper date handling
@@ -487,22 +529,19 @@ async function handleConversationData(
 	const now = new Date().toISOString();
 
 	for (const conv of convs) {
-		console.log('[FK DEBUG] Processing conversation:', conversation_uuid);
+		console.log("[FK DEBUG] Processing conversation:", conversation_uuid);
 		console.log(
-			'[FK DEBUG] Current leaf message:',
+			"[FK DEBUG] Current leaf message:",
 			conv.current_leaf_message_uuid
 		);
-		console.log(
-			'[FK DEBUG] Has messages?',
-			conv.chat_messages?.length ?? 0
-		);
+		console.log("[FK DEBUG] Has messages?", conv.chat_messages?.length ?? 0);
 
 		await db
 			.insert(schema.conversations)
 			.values({
 				uuid: conv.uuid,
-				name: conv.name || '',
-				summary: conv.summary || '',
+				name: conv.name || "",
+				summary: conv.summary || "",
 				model: conv.model || null,
 				created_at:
 					conv.created_at instanceof Date
@@ -514,15 +553,14 @@ async function handleConversationData(
 						: conv.updated_at || now,
 				settings: conv.settings || {},
 				is_starred: conv.is_starred,
-				current_leaf_message_uuid:
-					conv.current_leaf_message_uuid || null,
+				current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
 				project_uuid: conv.project_uuid || null,
 			})
 			.onConflictDoUpdate({
 				target: schema.conversations.uuid,
 				set: {
-					name: conv.name || '',
-					summary: conv.summary || '',
+					name: conv.name || "",
+					summary: conv.summary || "",
 					model: conv.model || null,
 					updated_at:
 						conv.updated_at instanceof Date
@@ -530,8 +568,7 @@ async function handleConversationData(
 							: conv.updated_at || now,
 					settings: conv.settings || {},
 					is_starred: conv.is_starred,
-					current_leaf_message_uuid:
-						conv.current_leaf_message_uuid || null,
+					current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
 					project_uuid: conv.project_uuid || null,
 				},
 			});
@@ -543,8 +580,8 @@ async function handleConversationData(
 					.values({
 						uuid: msg.uuid,
 						conversation_uuid: conv.uuid,
-						text: msg.text || '',
-						sender: msg.sender || 'unknown',
+						text: msg.text || "",
+						sender: msg.sender || "unknown",
 						index: msg.index || 0,
 						created_at:
 							msg.created_at instanceof Date
@@ -562,8 +599,8 @@ async function handleConversationData(
 					.onConflictDoUpdate({
 						target: schema.messages.uuid,
 						set: {
-							text: msg.text || '',
-							sender: msg.sender || 'unknown',
+							text: msg.text || "",
+							sender: msg.sender || "unknown",
 							index: msg.index || 0,
 							updated_at:
 								msg.updated_at instanceof Date
@@ -571,7 +608,7 @@ async function handleConversationData(
 									: msg.updated_at || now,
 							truncated: msg.truncated,
 							stop_reason: msg.stop_reason || null,
-							parent_message_uuid: msg.parent_message_uuid || '',
+							parent_message_uuid: msg.parent_message_uuid || "",
 							model: conv.model || null,
 						},
 					});
@@ -580,12 +617,26 @@ async function handleConversationData(
 	}
 }
 
+const loggerColors = {
+	info: Bun.color("blue", "ansi"),
+	error: Bun.color("red", "ansi"),
+	warn: Bun.color("yellow", "ansi"),
+	reset: "\x1b[0m",
+};
+const color_reset = "\x1b[0m";
+function log(level: keyof typeof loggerColors, message: string) {
+	const color = loggerColors[level];
+	console.log(
+		`[${color}${level.toUpperCase()}${color_reset}] ${message}${color_reset}`
+	);
+}
+
 // WebSocket server setup
 Bun.serve<WebSocketData>({
 	port: 3000,
 	fetch(req, server) {
 		if (server.upgrade(req)) return;
-		return new Response('Not found', { status: 404 });
+		return new Response("Not found", { status: 404 });
 	},
 	websocket: {
 		async open(ws) {
@@ -610,71 +661,64 @@ Bun.serve<WebSocketData>({
 
 		async message(ws, raw) {
 			const release = await messageMutex.acquire();
-			const payload = JSON.parse(raw.toString()) as {
-				type: string;
-				data: any;
-				conversation_uuid: string;
-				endpoint: string;
-				url: string;
-			};
-
-			const { type, data, conversation_uuid, endpoint, url } = payload;
+			const payload = JSON.parse(raw.toString()) as Payload;
+			log("info", ` - [WS] - ${payload.type}`);
+			const { conversation_uuid, endpoint, url, type } = payload;
+			const { content } = payload;
 			const now = new Date().toISOString();
 
 			try {
-				switch (type) {
-					case 'conversation_title':
+				switch (content.type) {
+					case "conversation_title":
 						await db
 							.update(schema.conversations)
 							.set({
-								name: data.title,
+								name: content.title,
 							})
-							.where(
-								eq(schema.conversations.uuid, conversation_uuid)
-							);
+							.where(eq(schema.conversations.uuid, conversation_uuid));
 						// Broadcast title change to all conversation participants
 						broadcastToConversation(conversation_uuid, {
-							type: 'conversation_title_updated',
-							title: data.title,
+							type: "conversation_title_updated",
+							title: content.title,
 						});
 						break;
-					case 'conversations_list':
+					case "conversations_list":
 						console.log(
-							'[DEBUG] Handling conversations_list with',
-							data.length,
-							'items'
+							"[DEBUG] Handling conversations_list with",
+							content.data.length,
+							"items"
 						);
-						await handleConversationData(conversation_uuid, data);
+						await handleConversationData(conversation_uuid, content.data);
 						break;
 
-					case 'conversation_detail': {
+					case "conversation_detail": {
 						console.log(
-							'[DEBUG] Handling conversation_detail:',
-							data.uuid
+							"[DEBUG] Handling conversation_detail:",
+							content.data.uuid
 						);
-						await handleConversationData(conversation_uuid, [data]);
-						ws.data.activeConversation = data.uuid;
+						await handleConversationData(conversation_uuid, [content.data]);
+						ws.data.activeConversation = content.data.uuid;
 						// Update client tracking
 						const client = clients.get(ws.data.clientId);
 						if (client) {
-							client.activeConversation = data.uuid;
+							client.activeConversation = content.data.uuid;
 							clients.set(ws.data.clientId, client);
 						}
 						break;
 					}
 
-					case 'message_start': {
+					case "message_start": {
 						// Initialize new message tracking
 						// Get or create sketch writer for this conversation
 						await sketchManager.writeMessageStart(
 							conversation_uuid,
-							data.message.uuid
+							content.message.uuid
 						);
 						ws.data.currentMessage = {
-							id: data.message.uuid,
+							id: content.message.uuid,
 							conversation_uuid: conversation_uuid,
 							contentBlocks: [],
-							model: data.message.model,
+							model: content.message.model,
 							artifacts: [],
 							created_at: new Date().toISOString(),
 							currentBlockIndex: 0,
@@ -682,7 +726,7 @@ Bun.serve<WebSocketData>({
 							blockTracker: {
 								index: 0,
 								type: ContentType.Text,
-								textContent: '',
+								textContent: "",
 								currentBlocks: new Map(),
 								toolRelationships: new Map(),
 							},
@@ -690,10 +734,10 @@ Bun.serve<WebSocketData>({
 
 						// Create initial message record
 						await db.insert(schema.messages).values({
-							uuid: data.message.uuid,
+							uuid: content.message.uuid,
 							conversation_uuid: conversation_uuid,
-							model: data.message.model,
-							sender: 'assistant',
+							model: content.message.model,
+							sender: "assistant",
 							created_at: now,
 							updated_at: now,
 						});
@@ -701,37 +745,30 @@ Bun.serve<WebSocketData>({
 						break;
 					}
 
-					case 'message_delta': {
+					case "message_delta": {
 						if (ws.data.currentMessage?.blockTracker) {
 							// Iterate through Map entries properly
-							for (const [toolUseId, rel] of ws.data
-								.currentMessage.blockTracker
+							for (const [toolUseId, rel] of ws.data.currentMessage.blockTracker
 								.toolRelationships) {
-								if (rel.status === 'success') {
+								if (rel.status === "success") {
 									await db
 										.update(schema.artifacts)
 										.set({
-											status: 'final',
-											updated_at:
-												new Date().toISOString(),
+											status: "final",
+											updated_at: new Date().toISOString(),
 										})
-										.where(
-											eq(
-												schema.artifacts.tool_use_id,
-												toolUseId
-											)
-										);
+										.where(eq(schema.artifacts.tool_use_id, toolUseId));
 								}
 							}
 						}
 						break;
 					}
 
-					case 'content_block_start': {
+					case "content_block_start": {
 						if (!ws.data.currentMessage?.blockTracker) break;
 
 						const tracker = ws.data.currentMessage.blockTracker;
-						const blockIndex = data.index;
+						const blockIndex = content.index;
 
 						// Delete existing block content if any
 						await db
@@ -742,10 +779,7 @@ Bun.serve<WebSocketData>({
 										schema.messageContents.messageUuid,
 										ws.data.currentMessage.id
 									),
-									eq(
-										schema.messageContents.blockIndex,
-										blockIndex
-									)
+									eq(schema.messageContents.blockIndex, blockIndex)
 								)
 							);
 
@@ -761,16 +795,15 @@ Bun.serve<WebSocketData>({
 						// Initialize new block
 						const newBlock = {
 							index: blockIndex,
-							type: data.content_block.type as ContentType,
-							textContent: '',
+							type: content.content_block.type as ContentType,
+							textContent: "",
 							toolUseId:
-								data.content_block.type === ContentType.ToolUse
-									? data.content_block.id ||
-									  `tool_${crypto.randomUUID()}`
+								content.content_block.type === ContentType.ToolUse
+									? content.content_block.id || `tool_${crypto.randomUUID()}`
 									: undefined,
 							toolResult: undefined,
 							fragments: [],
-							status: 'pending' as const,
+							status: "pending" as const,
 							replacedBy: undefined,
 							is_error: false,
 						};
@@ -781,7 +814,7 @@ Bun.serve<WebSocketData>({
 						if (newBlock.toolUseId) {
 							tracker.toolRelationships.set(newBlock.toolUseId, {
 								toolUseIndex: blockIndex,
-								status: 'pending',
+								status: "pending",
 							});
 						}
 
@@ -795,72 +828,69 @@ Bun.serve<WebSocketData>({
 						break;
 					}
 
-					case 'content_block_delta': {
+					case "content_block_delta": {
 						if (!ws.data.currentMessage) break;
-						const block =
-							ws.data.currentMessage.blockTracker.currentBlocks.get(
-								data.index
-							);
+						const block = ws.data.currentMessage.blockTracker.currentBlocks.get(
+							content.index
+						);
 						if (!block) break;
 
 						const fragmentSequence = block.fragments.length;
 						const baseValues = {
 							id: crypto.randomUUID(),
 							messageUuid: ws.data.currentMessage.id,
-							blockIndex: data.index,
+							blockIndex: content.index,
 							fragmentSequence,
 							createdAt: now,
 							updatedAt: now,
 						};
 
-						if (data.delta?.text) {
+						if (content.delta?.type === "text_delta") {
 							await db.insert(schema.messageContents).values({
 								...baseValues,
 								contentType: ContentType.Text,
-								textContent: data.delta.text,
+								textContent: content.delta.text,
 							});
-							block.fragments.push(data.delta.text);
-							block.textContent += data.delta.text;
+							block.fragments.push(content.delta.text);
+							block.textContent += content.delta.text;
 							await sketchManager.writeDeltaContent(
 								conversation_uuid,
-								data.index,
-								data.delta.text
+								content.index,
+								content.delta.text
 							);
 						}
 
-						if (data.delta?.partial_json) {
+						if (content.delta?.type === "input_json_delta") {
 							await db.insert(schema.messageContents).values({
 								...baseValues,
 								contentType: ContentType.ToolUse,
-								toolInput: data.delta.partial_json,
+								toolInput: content.delta.partial_json,
 							});
-							block.fragments.push(data.delta.partial_json);
+							block.fragments.push(content.delta.partial_json);
 							if (block.type === ContentType.ToolUse) {
 								const relationship =
 									ws.data.currentMessage.blockTracker.toolRelationships.get(
 										block.toolUseId!
 									);
 								if (relationship) {
-									relationship.status = 'pending';
+									relationship.status = "pending";
 								}
 							}
 							await sketchManager.writeDeltaContent(
 								conversation_uuid,
-								data.index,
-								data.delta.partial_json
+								content.index,
+								content.delta.partial_json
 							);
 						}
 						break;
 					}
 
-					case 'content_block_stop': {
+					case "content_block_stop": {
 						if (!ws.data.currentMessage) break;
 
-						const blockIndex = data.index;
+						const blockIndex = content.index;
 						const block =
-							ws.data.currentMessage.blockTracker.currentBlocks.get(
-								blockIndex
-							);
+							ws.data.currentMessage.blockTracker.currentBlocks.get(blockIndex);
 						if (!block) break;
 
 						// Finalize text block
@@ -868,18 +898,13 @@ Bun.serve<WebSocketData>({
 							await db
 								.update(schema.messageContents)
 								.set({ isComplete: true })
-								.where(
-									eq(
-										schema.messageContents.blockIndex,
-										blockIndex
-									)
-								);
+								.where(eq(schema.messageContents.blockIndex, blockIndex));
 						}
 
 						// Handle tool use completion
 						if (block.type === ContentType.ToolUse) {
 							try {
-								const combinedJson = block.fragments.join('');
+								const combinedJson = block.fragments.join("");
 								const parsed = JSON.parse(combinedJson);
 
 								await db.transaction(async (tx) => {
@@ -890,30 +915,20 @@ Bun.serve<WebSocketData>({
 											isComplete: true,
 											toolResult: null,
 										})
-										.where(
-											eq(
-												schema.messageContents
-													.blockIndex,
-												blockIndex
-											)
-										);
+										.where(eq(schema.messageContents.blockIndex, blockIndex));
 
 									await tx.insert(schema.artifacts).values({
 										id: parsed.id,
-										version_uuid:
-											parsed.version_uuid ||
-											crypto.randomUUID(),
+										version_uuid: parsed.version_uuid || crypto.randomUUID(),
 										content: parsed.content,
 										conversation_uuid:
-											ws.data.currentMessage!
-												.conversation_uuid,
+											ws.data.currentMessage!.conversation_uuid,
 										type: parsed.type,
 										title: parsed.title,
 										language: parsed.language,
-										message_uuid:
-											ws.data.currentMessage?.id,
+										message_uuid: ws.data.currentMessage?.id,
 										tool_use_id: block.toolUseId,
-										status: 'draft',
+										status: "draft",
 										created_at: now,
 										updated_at: now,
 									});
@@ -931,20 +946,15 @@ Bun.serve<WebSocketData>({
 									`\n<!-- INVALID TOOL USE BLOCK ${blockIndex} -->\n`
 								);
 
-								block.status = 'invalid';
+								block.status = "invalid";
 								await db
 									.update(schema.messageContents)
 									.set({ isComplete: false })
-									.where(
-										eq(
-											schema.messageContents.blockIndex,
-											blockIndex
-										)
-									);
+									.where(eq(schema.messageContents.blockIndex, blockIndex));
 							}
 						}
 
-						// Handle tool results (modified to use block type instead of data.content_block)
+						// Handle tool results (modified to use block type instead ofcontent.content_block)
 						if (block.type === ContentType.ToolResult) {
 							const relationship =
 								ws.data.currentMessage.blockTracker.toolRelationships.get(
@@ -952,79 +962,50 @@ Bun.serve<WebSocketData>({
 								);
 
 							if (relationship) {
-								relationship.status = block.is_error
-									? 'error'
-									: 'success';
+								relationship.status = block.is_error ? "error" : "success";
 								relationship.toolResultIndex = blockIndex;
 
 								await db.transaction(async (tx) => {
 									await tx
 										.update(schema.artifacts)
 										.set({
-											status: block.is_error
-												? 'invalid'
-												: 'valid',
+											status: block.is_error ? "invalid" : "valid",
 											updated_at: now,
 										})
-										.where(
-											eq(
-												schema.artifacts.tool_use_id,
-												block.toolUseId!
-											)
-										);
+										.where(eq(schema.artifacts.tool_use_id, block.toolUseId!));
 
 									await tx
 										.update(schema.messageContents)
 										.set({
 											isComplete: true,
-											toolResult:
-												block.fragments.join(''),
+											toolResult: block.fragments.join(""),
 											toolUseId: block.toolUseId,
 										})
-										.where(
-											eq(
-												schema.messageContents
-													.blockIndex,
-												blockIndex
-											)
-										);
+										.where(eq(schema.messageContents.blockIndex, blockIndex));
 								});
 							}
 						}
 						break;
 					}
 
-					case 'message_stop': {
+					case "message_stop": {
 						if (!ws.data.currentMessage) break;
-						const conversationUUID =
-							ws.data.currentMessage.conversation_uuid;
+						const conversationUUID = ws.data.currentMessage.conversation_uuid;
 
 						// Finalize all blocks and relationships
 						await db.transaction(async (tx) => {
 							// Cleanup invalid/replaced blocks
-							for (const [index, block] of ws.data.currentMessage!
-								.blockTracker.currentBlocks) {
-								if (block.status !== 'valid') {
+							for (const [index, block] of ws.data.currentMessage!.blockTracker
+								.currentBlocks) {
+								if (block.status !== "valid") {
 									await tx
 										.delete(schema.messageContents)
-										.where(
-											eq(
-												schema.messageContents
-													.blockIndex,
-												index
-											)
-										);
+										.where(eq(schema.messageContents.blockIndex, index));
 
 									if (block.toolUseId) {
 										await tx
 											.delete(schema.artifacts)
-											.where(
-												eq(
-													schema.artifacts
-														.tool_use_id,
-													block.toolUseId
-												)
-											);
+											.where(eq(schema.artifacts.tool_use_id, block.toolUseId));
 									}
 								}
 							}
@@ -1032,33 +1013,22 @@ Bun.serve<WebSocketData>({
 							// Assemble final message text from valid blocks
 							const textBlocks = await tx
 								.select({
-									textContent:
-										schema.messageContents.textContent,
+									textContent: schema.messageContents.textContent,
 								})
 								.from(schema.messageContents)
 								.where(
 									and(
 										eq(
 											schema.messageContents.messageUuid,
-											ws.data.currentMessage.id
+											ws.data.currentMessage!.id
 										),
-										eq(
-											schema.messageContents.contentType,
-											ContentType.Text
-										),
-										eq(
-											schema.messageContents.isComplete,
-											true
-										)
+										eq(schema.messageContents.contentType, ContentType.Text),
+										eq(schema.messageContents.isComplete, true)
 									)
 								)
-								.orderBy(
-									asc(schema.messageContents.blockIndex)
-								);
+								.orderBy(asc(schema.messageContents.blockIndex));
 
-							const fullText = textBlocks
-								.map((b) => b.textContent)
-								.join('\n');
+							const fullText = textBlocks.map((b) => b.textContent).join("\n");
 
 							// Update message record
 							await tx
@@ -1066,16 +1036,9 @@ Bun.serve<WebSocketData>({
 								.set({
 									text: fullText,
 									updated_at: now,
-									stop_reason:
-										data.stop_reason ||
-										StopReason.StopSequence,
+									stop_reason: content.stop_reason,
 								})
-								.where(
-									eq(
-										schema.messages.uuid,
-										ws.data.currentMessage.id
-									)
-								);
+								.where(eq(schema.messages.uuid, ws.data.currentMessage!.id));
 						});
 
 						// Finalize sketch file
@@ -1085,8 +1048,8 @@ Bun.serve<WebSocketData>({
 						);
 
 						broadcastToConversation(conversationUUID, {
-							type: 'message_completed',
-							messageId: ws.data.currentMessage!.id,
+							type: "message_completed",
+							messageId: ws.data.currentMessage.id,
 						});
 
 						// await sketchWriter.end();
@@ -1096,24 +1059,21 @@ Bun.serve<WebSocketData>({
 						break;
 					}
 
-					case 'message_limit':
+					case "message_limit":
+						break;
+						// biome-ignore lint/correctness/noUnreachable: <explanation>
 						if (ws.data.currentMessage) {
-							const writer = await sketchManager.getWriter(
-								conversation_uuid
-							);
-							await sketchManager.writeContentBlock(
-								conversation_uuid,
-								{
-									index: -2, // Special index for timestamp
-									type: ContentType.Text,
-									content: `\n_Generated at: ${now}_\n`,
-								}
-							);
+							const writer = await sketchManager.getWriter(conversation_uuid);
+							await sketchManager.writeContentBlock(conversation_uuid, {
+								index: -2, // Special index for timestamp
+								type: ContentType.Text,
+								content: `\n_Generated at: ${now}_\n`,
+							});
 
 							const textBlocks = Array.from(
 								ws.data.currentMessage.blockTracker.currentBlocks.values()
 							)
-								.filter((b) => b.type === 'text')
+								.filter((b) => b.type === "text")
 								.sort((a, b) => a.index - b.index);
 
 							for (const block of textBlocks) {
@@ -1125,116 +1085,95 @@ Bun.serve<WebSocketData>({
 							// await sketchWriter.end();
 
 							const fullContent: ChatMessageContent[] =
-								ws.data.currentMessage.contentBlocks.map(
-									(block) => {
-										if (
-											block.type ===
-											ContentType.ToolResult
-										) {
-											return {
-												type: ContentType.ToolResult,
-												content: [
-													{
-														type: ContentType.Text,
-														text: block.content,
-													},
-												],
-												is_error: false,
-											};
-										}
-
-										if (
-											block.type ===
-												ContentType.ToolUse &&
-											block.jsonParts
-										) {
-											try {
-												const parsed = JSON.parse(
-													block.jsonParts.join('')
-												);
-												return {
-													type: ContentType.ToolUse,
-													name: 'artifacts',
-													input: {
-														id: parsed.id,
-														version_uuid:
-															parsed.version_uuid ||
-															'',
-														content: parsed.content,
-														language:
-															parsed.language,
-														type: parsed.type as InputType,
-														command: parsed.command,
-													},
-												};
-											} catch (error) {
-												return {
-													type: ContentType.Text,
-													text: 'Invalid tool use content',
-													is_error: true,
-												};
-											}
-										}
-
+								ws.data.currentMessage.contentBlocks.map((block) => {
+									if (block.type === ContentType.ToolResult) {
 										return {
-											type: ContentType.Text,
-											text: block.content,
+											type: ContentType.ToolResult,
+											content: [
+												{
+													type: ContentType.Text,
+													text: block.content,
+												},
+											],
+											is_error: false,
 										};
 									}
-								);
+
+									if (block.type === ContentType.ToolUse && block.jsonParts) {
+										try {
+											const parsed = JSON.parse(block.jsonParts.join(""));
+											return {
+												type: ContentType.ToolUse,
+												name: "artifacts",
+												input: {
+													id: parsed.id,
+													version_uuid: parsed.version_uuid || "",
+													content: parsed.content,
+													language: parsed.language,
+													type: parsed.type as InputType,
+													command: parsed.command,
+												},
+											};
+										} catch (error) {
+											return {
+												type: ContentType.Text,
+												text: "Invalid tool use content",
+												is_error: true,
+											};
+										}
+									}
+
+									return {
+										type: ContentType.Text,
+										text: block.content,
+									};
+								});
 
 							await db
 								.update(schema.messages)
 								.set({
 									updated_at: now,
-									stop_reason:
-										data.stop_reason ||
-										StopReason.StopSequence,
+									stop_reason: content.stop_reason || StopReason.StopSequence,
 								})
-								.where(
-									eq(
-										schema.messages.uuid,
-										ws.data.currentMessage.id
-									)
-								);
+								.where(eq(schema.messages.uuid, ws.data.currentMessage.id));
 
 							ws.data.currentMessage = null;
 						}
 						break;
 
-					case 'artifact':
-						await db
-							.insert(schema.artifacts)
-							.values({
-								id: data.id,
-								conversation_uuid: data.conversation_uuid,
-								version_uuid: data.version_uuid || null,
-								type: data.type || null,
-								title: data.title || null,
-								content: data.content,
-								language: data.language || null,
-							})
-							.onConflictDoUpdate({
-								target: schema.artifacts.id,
-								set: {
-									version_uuid: data.version_uuid || null,
-									type: data.type || null,
-									title: data.title || null,
-									content: data.content,
-									language: data.language || null,
-								},
-							});
-						break;
+					// case "artifact":
+					// 	await db
+					// 		.insert(schema.artifacts)
+					// 		.values({
+					// 			id: data.id,
+					// 			conversation_uuid: data.conversation_uuid,
+					// 			version_uuid: data.version_uuid || null,
+					// 			type: data.type || null,
+					// 			title: data.title || null,
+					// 			content: data.content,
+					// 			language: data.language || null,
+					// 		})
+					// 		.onConflictDoUpdate({
+					// 			target: schema.artifacts.id,
+					// 			set: {
+					// 				version_uuid: data.version_uuid || null,
+					// 				type: data.type || null,
+					// 				title: data.title || null,
+					// 				content: data.content,
+					// 				language: data.language || null,
+					// 			},
+					// 		});
+					// 	break;
 
 					default:
-						console.warn('Unhandled event type:', type);
+						console.warn("Unhandled event type:", type);
 				}
 			} catch (error) {
 				console.error(
-					'Message handling error:',
+					"Message handling error:",
 					error instanceof Error ? error.message : String(error),
 					type,
-					data,
+					content,
 					conversation_uuid,
 					endpoint,
 					url
@@ -1247,4 +1186,4 @@ Bun.serve<WebSocketData>({
 	},
 });
 
-console.log('Server running on port 3000');
+console.log("Server running on port 3000");
