@@ -1,5 +1,4 @@
-import { type BunFile, FileSink } from "bun";
-import { PathLike } from "node:fs";
+import type { BunFile } from "bun";
 import type { ChatConversation } from "./types/claude";
 
 export enum ContentType {
@@ -8,106 +7,158 @@ export enum ContentType {
 	ToolUse = "tool_use",
 }
 
-interface Position {
-	line: number;
-	column: number;
-	offset: number;
+type Position = {
+	line: number; // 0-based line number
+	column: number; // 0-based column number
+	offset: number; // 0-based character offset from start
+};
+
+interface PositionRange {
+	start: Position;
+	end: Position;
 }
 
 type MessageContentBlock = {
 	index: number;
 	type: ContentType;
 	content: string;
+	position: PositionRange;
 };
 
 type ConversationMessage = {
 	uuid: string;
 	generated: string;
-	position: Position;
+	position: PositionRange;
 	content: MessageContentBlock[];
 };
 
-class Counter {
-	value = 0;
-	increment() {
-		return this.value++;
-	}
-	reset() {
-		this.value = 0;
-	}
-	set(value: number) {
-		this.value = value;
-	}
-	get current() {
-		return this.value;
-	}
-}
-
 class ConversationWriter {
 	private messages: Map<string, ConversationMessage> = new Map();
-	private currentMessage: Partial<ConversationMessage> | null = null;
-	private currentBlock: Partial<MessageContentBlock> | null = null;
-	private blockMap: Map<number, MessageContentBlock> = new Map();
-
-	private blockIndex = 0;
-
+	private text = "";
+	private currentMessage: ConversationMessage | null = null;
+	private currentBlock: MessageContentBlock | null = null;
+	private blockIndexCounter = 0;
 	metadata: Partial<ChatConversation> = {};
+	private inFrontMatter = false;
+	private inMessage = false;
 
-	parseComment(comment: string) {
+	private parseComment(comment: string): [string, string] {
 		const colonIndex = comment.indexOf("=");
-		return [comment.slice(0, colonIndex), comment.slice(colonIndex + 1).trim()];
+		return [
+			comment.slice(0, colonIndex).trim(),
+			comment.slice(colonIndex + 1).trim(),
+		];
 	}
 
-	// Method to get a message by UUID
-	getMessage(uuid: string): ConversationMessage | undefined {
-		// console.log("messages", this.messages);
-		return this.messages.get(uuid);
+	getMessage(uuid: string) {
+		const message = this.messages.get(uuid);
+		if (!message) {
+			throw new Error(`Message with UUID ${uuid} not found`);
+		}
+		return message;
 	}
 
-	// Method to get a block by its index
 	getMessageBlock(
 		messageId: string,
 		blockIndex: number
 	): MessageContentBlock | undefined {
-		const message = this.getMessage(messageId);
-		if (!message) return undefined;
-		return message.content.find((block) => block.index === blockIndex);
+		return this.getMessage(messageId)?.content.find(
+			(b) => b.index === blockIndex
+		);
 	}
 
-	findMessageByBlockIndex(blockIndex: number): ConversationMessage | undefined {
-		for (const message of this.messages.values()) {
-			if (message.content.some((block) => block.index === blockIndex)) {
-				return message;
-			}
+	async replaceMessageBlockContent(
+		messageId: string,
+		blockIndex: number,
+		newContent: string
+	): Promise<void> {
+		const block = this.getMessageBlock(messageId, blockIndex);
+		if (!block) {
+			throw new Error(
+				`Block with index ${blockIndex} not found in message ${messageId}`
+			);
 		}
-		return undefined;
+
+		const oldLength = block.content.length;
+		const newLength = newContent.length;
+		const delta = newLength - oldLength;
+
+		// Simple text splice
+		this.text =
+			this.text.slice(0, block.position.start.offset) +
+			newContent +
+			this.text.slice(block.position.end.offset);
+
+		// Update just the critical position data
+		block.content = newContent;
+		block.position.end.offset = block.position.start.offset + newLength;
+
+		// Fast offset-only updates for subsequent blocks
+		const message = this.getMessage(messageId);
+		for (let i = blockIndex + 1; i < message.content.length; i++) {
+			const nextBlock = message.content[i];
+			nextBlock.position.start.offset += delta;
+			nextBlock.position.end.offset += delta;
+		}
+
+		// Only update message end if needed
+		if (blockIndex === message.content.length - 1) {
+			message.position.end.offset += delta;
+		}
 	}
 
-	async parse(file: BunFile) {
-		const text = await file.text();
-		const lines = text.split("\n");
-
-		let inFrontMatter = false;
-		this.blockMap.clear(); // Clear block map before parsing
+	async parse(file?: BunFile) {
+		this.text = (await file?.text()) || this.text;
+		const lines = this.text.split("\n");
+		let currentLine = 0;
+		let currentOffset = 0;
 
 		for (const line of lines) {
-			const trimmedLine = line.trim();
+			const lineLength = line.length;
+			const hasNewline = currentLine < lines.length - 1;
+			const totalLineLength = lineLength + (hasNewline ? 1 : 0);
 
-			if (trimmedLine === "---") {
-				inFrontMatter = !inFrontMatter;
+			// Handle separators differently based on context
+			if (line.trim() === "---") {
+				if (!this.inFrontMatter && currentLine === 0) {
+					// Start of front matter
+					this.inFrontMatter = true;
+				} else if (this.inFrontMatter) {
+					// End of front matter
+					this.inFrontMatter = false;
+					this.inMessage = false;
+				} else {
+					// Message separator - reset current message state
+					this.inMessage = false;
+					this.currentMessage = null;
+					this.currentBlock = null;
+				}
+				currentOffset += totalLineLength;
+				currentLine++;
 				continue;
 			}
 
-			if (inFrontMatter) {
-				this.parseFrontMatterLine(trimmedLine);
-				continue;
+			if (this.inFrontMatter) {
+				this.parseFrontMatterLine(line);
+			} else {
+				const commentMatch = line.match(/^\[\/\/\]: # "(.+)"$/);
+				if (commentMatch) {
+					this.parseMetadataLine(
+						commentMatch[1],
+						currentLine,
+						currentOffset,
+						line
+					);
+					if (commentMatch[1].startsWith("message_uuid")) {
+						this.inMessage = true;
+					}
+				} else if (this.inMessage && this.currentBlock) {
+					this.parseContentLine(line, currentLine, currentOffset, lineLength);
+				}
 			}
 
-			if (trimmedLine.startsWith("[//]: #")) {
-				this.parseCommentLine(trimmedLine);
-			} else if (trimmedLine) {
-				this.handleContentLine(trimmedLine);
-			}
+			currentOffset += totalLineLength;
+			currentLine++;
 		}
 
 		return {
@@ -117,80 +168,154 @@ class ConversationWriter {
 	}
 
 	private parseFrontMatterLine(line: string): void {
-		const colonIndex = line.indexOf(":");
-		if (colonIndex === -1) return;
-
-		const [key, value] = [
-			line.slice(0, colonIndex),
-			line.slice(colonIndex + 1).trim(),
-		];
-		this.metadata[key] = value;
+		const [key, value] = line.split(":").map((s) => s.trim());
+		if (key && value) this.metadata[key] = value;
 	}
 
-	private parseCommentLine(line: string): void {
-		const content = line.split("[//]: #").at(-1)?.trim().slice(1, -1);
-		if (!content) return;
-		// console.log(content);
-		const [key, value] = this.parseComment(content);
-		// console.log(key);
-		if (key === "message_uuid") {
-			this.currentMessage = { uuid: value, content: [] };
-			this.messages.set(value, this.currentMessage as ConversationMessage);
-		} else if (content.startsWith("generated")) {
-			if (this.currentMessage) {
-				this.currentMessage.generated = value;
-			}
-		} else if (content.startsWith("blocktype")) {
-			this.currentBlock = {
-				content: "",
-				type: value as ContentType,
-				index: this.blockIndex++,
-			};
-			if (this.currentMessage?.content) {
-				this.currentMessage.content.push(
-					this.currentBlock as MessageContentBlock
-				);
-				// Add block to blockMap
-				this.blockMap.set(
-					this.currentBlock.index,
-					this.currentBlock as MessageContentBlock
-				);
-			}
+	private parseMetadataLine(
+		commentContent: string,
+		lineNumber: number,
+		offset: number,
+		line: string // Add this parameter
+	): void {
+		const [key, value] = this.parseComment(commentContent);
+		const quoteStart = line.indexOf('"');
+		const quoteEnd = line.lastIndexOf('"');
+
+		const position: PositionRange = {
+			start: {
+				line: lineNumber,
+				column: quoteStart + 1, // +1 to skip opening quote
+				offset: offset + quoteStart + 1,
+			},
+			end: {
+				line: lineNumber,
+				column: quoteEnd,
+				offset: offset + quoteEnd,
+			},
+		};
+
+		switch (key) {
+			case "message_uuid":
+				this.currentBlock = null;
+
+				this.currentMessage = {
+					uuid: value,
+					generated: "",
+					content: [],
+					position: {
+						start: { ...position.start },
+						end: { ...position.end },
+					},
+				};
+				this.messages.set(value, this.currentMessage);
+
+				break;
+
+			case "generated":
+				if (this.currentMessage) {
+					// Remove trailing underscore from the sample data
+					this.currentMessage.generated = value.replace(/_$/, "");
+					this.currentMessage.position.end = position.end;
+				}
+				break;
+
+			case "blocktype":
+				if (this.currentMessage) {
+					this.currentBlock = {
+						index: this.blockIndexCounter++,
+						type: value as ContentType,
+						content: "",
+						position: {
+							start: { ...position.start },
+							end: { ...position.end },
+						},
+					};
+					this.currentMessage.content.push(this.currentBlock);
+				}
+				break;
 		}
 	}
 
-	private handleContentLine(line: string): void {
-		if (this.currentBlock) {
-			this.currentBlock.content +=
-				(this.currentBlock.content ? "\n" : "") + line;
+	private parseContentLine(
+		line: string,
+		lineNumber: number,
+		offset: number,
+		lineLength: number
+	): void {
+		if (!this.currentBlock) return;
+
+		// Preserve original line content including whitespace
+		this.currentBlock.content += `${
+			this.currentBlock.content ? "\n" : ""
+		}${line}`;
+
+		// Update positions
+		this.currentBlock.position.end = {
+			line: lineNumber,
+			column: lineLength,
+			offset: offset + lineLength,
+		};
+
+		if (this.currentMessage) {
+			this.currentMessage.position.end = this.currentBlock.position.end;
 		}
 	}
 
 	render(): string {
-		let result = "---\n";
+		let output = "---\n";
+
+		// Front matter
 		for (const [key, value] of Object.entries(this.metadata)) {
-			result += `${key}: ${value}\n`;
+			output += `${key}: ${value}\n`;
 		}
-		result += "---\n\n";
+		output += "---\n\n";
+
+		// Messages
 		for (const message of this.messages.values()) {
-			result += `[//]: # (message_uuid = ${message.uuid})\n`;
-			result += `[//]: # (generated = ${message.generated})\n\n`;
+			output += `[//]: # (message_uuid = ${message.uuid})\n`;
+			output += `[//]: # (generated = ${message.generated})\n\n`;
+
 			for (const block of message.content) {
-				result += `[//]: # (blocktype = ${block.type})\n`;
-				result += `${block.content}\n`;
+				output += `[//]: # (blocktype = ${block.type})\n`;
+				output += `${block.content}\n\n`;
 			}
+
+			output += "---\n";
 		}
-		return result;
+
+		return output;
 	}
 }
 
-// test
 const conv = new ConversationWriter();
+const file = Bun.file(
+	"./server/conversations/5c05a54b-73c1-48ac-9f97-23faf4b48941.md"
+);
+const time = Date.now();
 await conv.parse(
 	Bun.file("./server/conversations/5c05a54b-73c1-48ac-9f97-23faf4b48941.md")
 );
-console.log(conv.metadata);
-console.log(conv.getMessage("c6453bf5-68ef-403c-931e-1512dfb3aa6c"));
-await Bun.file(
+console.log(`Parsed in ${Date.now() - time}ms`);
+const message = conv.getMessage("063dcb2b-9a74-4ae0-b440-ecd11c2cfb88");
+// console.log(conv.metadata);
+conv.replaceMessageBlockContent(
+	message.uuid,
+	1,
+	`Hi there!
+    How are you doing today? Is there anything I can help 
+    you with?`
+);
+// console.log(
+// 	await file
+// 		.text()
+// 		.then((text) =>
+// 			text.slice(message?.position.start.offset, message?.position.end.offset)
+// 		)
+// );
+const out = await Bun.file(
 	"./server/conversations/5c05a54b-73c1-48ac-9f97-23faf4b48941-rendered.md"
-).write(conv.render());
+);
+await out.write(conv.render());
+// console.log(conv.render());
+process.exit(0);
