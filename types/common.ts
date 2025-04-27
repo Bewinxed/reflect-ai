@@ -8,8 +8,6 @@ import type { ClaudeEvent } from "./claude";
 export type Payload = {
 	/**
 	 * The type of the event contained within the 'content' field.
-	 * This seems redundant as `content.type` is the primary discriminator used.
-	 * Kept for potential compatibility but recommend relying on `content.type`.
 	 */
 	type: ClaudeEvent["type"];
 

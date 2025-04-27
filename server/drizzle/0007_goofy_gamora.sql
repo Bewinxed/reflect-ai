@@ -1,1 +1,0 @@
-DROP INDEX `unique_convo`;

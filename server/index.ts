@@ -1,64 +1,16 @@
 import { Mutex } from "async-mutex";
-import { mkdir } from "node:fs/promises";
 
-import type { SSEEvent } from "../types/claudeSSE";
-import type { ClaudeEvent } from "../types/claude";
-import type { Payload } from "../types/common";
-import { Database } from "bun:sqlite";
-import { and, asc, eq, max, sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import * as schema from "./schema";
-import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import type { FileSink, ServerWebSocket } from "bun";
+import { Database } from "bun:sqlite";
+import { and, eq, sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { mkdirSync, type PathLike } from "node:fs";
+import { ContentType, StopReason } from "../types/claude";
+import type { Payload } from "../types/common";
+import * as schema from "./schema";
 
-// Type definitions
-export interface ChatConversation {
-	uuid: string;
-	name: string;
-	summary: string;
-	model: string | null;
-	created_at: Date;
-	updated_at: Date;
-	settings: Settings;
-	is_starred: boolean;
-	current_leaf_message_uuid: string | null;
-	project_uuid?: string | null;
-	chat_messages?: ChatMessage[];
-	project?: Project | null;
-}
-
-export interface Project {
-	uuid: string;
-	name: string;
-}
-
-export interface Settings {
-	preview_feature_uses_artifacts: boolean | null;
-	preview_feature_uses_latex: boolean | null;
-	preview_feature_uses_citations: null;
-	enabled_artifacts_attachments: boolean | null;
-	enabled_turmeric: null;
-	paprika_mode: null;
-}
-
-export interface ChatMessage {
-	uuid: string;
-	text: string;
-	content: ChatMessageContent[];
-	sender: Sender;
-	index: number;
-	created_at: Date;
-	updated_at: Date;
-	truncated: boolean;
-	attachments: Attachment[];
-	files: any[];
-	files_v2: any[];
-	sync_sources: any[];
-	parent_message_uuid: string;
-	stop_reason?: StopReason;
-}
-
+// Define any server-specific types that aren't in the main type files
 interface Attachment {
 	id: string;
 	message_uuid: string;
@@ -67,65 +19,6 @@ interface Attachment {
 	file_type: string;
 	extracted_content: string;
 	created_at: string;
-}
-
-export interface Artifact {
-	id: string;
-	version_uuid: string;
-	conversation_uuid?: string | null; // Added null type
-	type?: string | null;
-	title?: string | null;
-	content: string;
-	language?: string | null;
-	status: "draft" | "valid" | "invalid" | "final";
-	tool_use_id?: string | null;
-	message_uuid?: string | null;
-	created_at?: string;
-	updated_at?: string;
-}
-
-export interface ChatMessageContent {
-	type: ContentType;
-	text?: string;
-	name?: string;
-	input?: Input;
-	content?: ContentContent[];
-	is_error?: boolean;
-}
-
-export interface ContentContent {
-	type: ContentType;
-	text: string;
-}
-
-export interface Input {
-	id: string;
-	type?: string;
-	title?: string;
-	command?: string;
-	content?: string;
-	language?: Language;
-	version_uuid: string;
-	new_str?: string;
-	old_str?: string;
-}
-
-export enum ContentType {
-	Text = "text",
-	ToolResult = "tool_result",
-	ToolUse = "tool_use",
-}
-
-export type Language = string;
-
-export type InputType = "application/vnd.ant.code";
-
-export type Name = "artifacts";
-
-export type Sender = "human" | "assistant";
-
-export enum StopReason {
-	StopSequence = "stop_sequence",
 }
 
 type MessageContentBlock = {
@@ -157,7 +50,7 @@ class ConversationWriter {
 		let currentBlock: ConversationMessageBlock | null = null;
 		let blockStartLine = 0;
 
-		
+		const blocks = new Map<string, ConversationMessageBlock>();
 
 		lines.forEach((line, index) => {
 			const blockMatch = line.match(/<!-- (?:(?!-->).)*-->/);
@@ -175,7 +68,7 @@ class ConversationWriter {
 					currentBlock = {
 						uuid,
 						position: [index, -1],
-						content: "",
+						content: { index: 0, type: ContentType.Text, content: "" },
 					};
 					blockStartLine = index;
 				}
@@ -426,6 +319,46 @@ class SketchManager {
 	}
 }
 
+/**
+ * Ensure a project exists before referencing it
+ * @param projectUuid The project UUID to check
+ * @returns The project UUID if it exists, null otherwise
+ */
+async function ensureProjectExists(projectUuid: string | null | undefined): Promise<string | null> {
+	if (!projectUuid) return null;
+
+	try {
+		const projectExists = await db
+			.select({ count: sql`count(*)` })
+			.from(schema.projects)
+			.where(eq(schema.projects.uuid, projectUuid));
+
+		if (projectExists[0]?.count > 0) {
+			return projectUuid;
+		}
+
+		// Attempt to create the project with a placeholder name
+		// This is a fallback to prevent foreign key errors
+		try {
+			await db
+				.insert(schema.projects)
+				.values({
+					uuid: projectUuid,
+					name: `Project ${projectUuid.substring(0, 8)}`,
+				});
+
+			console.log(`Created placeholder project ${projectUuid}`);
+			return projectUuid;
+		} catch (createError) {
+			console.error(`Failed to create placeholder project ${projectUuid}:`, createError);
+			return null;
+		}
+	} catch (error) {
+		console.error(`Error checking project ${projectUuid}:`, error);
+		return null;
+	}
+}
+
 interface ContentBlockTracker {
 	index: number;
 	type: ContentType;
@@ -516,106 +449,217 @@ const messageMutex = new Mutex();
 // Updated conversation handler with proper date handling
 async function handleConversationData(
 	conversation_uuid: string,
-	data: ChatConversation | ChatConversation[]
+	data: any
 ) {
-	const convs = Array.isArray(data)
-		? data
-		: [
-				{
-					...data,
-					conversation_uuid,
-				},
-		  ];
+	// Handle undefined, null or empty data
+	if (!data) {
+		console.log(`No conversation data to process for ${conversation_uuid}`);
+		return;
+	}
+
+	// Since we're getting data from external sources, handle it generically
+	const convs = Array.isArray(data) ? data : [{ ...data, conversation_uuid }];
+
+	if (convs.length === 0) {
+		console.log(`No conversation data to process for ${conversation_uuid}`);
+		return;
+	}
+
 	const now = new Date().toISOString();
 
 	for (const conv of convs) {
-		console.log("[FK DEBUG] Processing conversation:", conversation_uuid);
-		console.log(
-			"[FK DEBUG] Current leaf message:",
-			conv.current_leaf_message_uuid
-		);
-		console.log("[FK DEBUG] Has messages?", conv.chat_messages?.length ?? 0);
+		// Validate critical fields
+		if (!conv.uuid && !conversation_uuid) {
+			console.error("Cannot process conversation without UUID");
+			continue;
+		}
 
-		await db
-			.insert(schema.conversations)
-			.values({
-				uuid: conv.uuid,
-				name: conv.name || "",
-				summary: conv.summary || "",
-				model: conv.model || null,
-				created_at:
-					conv.created_at instanceof Date
-						? conv.created_at.toISOString()
-						: conv.created_at || now,
-				updated_at:
-					conv.updated_at instanceof Date
-						? conv.updated_at.toISOString()
-						: conv.updated_at || now,
-				settings: conv.settings || {},
-				is_starred: conv.is_starred,
-				current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
-				project_uuid: conv.project_uuid || null,
-			})
-			.onConflictDoUpdate({
-				target: schema.conversations.uuid,
-				set: {
+		const convUuid = conv.uuid || conversation_uuid;
+
+		try {
+			// Sanitize the data to avoid foreign key issues
+			const projectUuid = conv.project_uuid;
+
+			// If project_uuid is provided, verify it exists
+			if (projectUuid) {
+				const projectExists = await db
+					.select({ count: sql`count(*)` })
+					.from(schema.projects)
+					.where(eq(schema.projects.uuid, projectUuid));
+
+				if (projectExists[0]?.count === 0) {
+					// Project doesn't exist, remove the reference to avoid foreign key error
+					console.warn(`Project ${projectUuid} not found for conversation ${convUuid}, removing reference`);
+					conv.project_uuid = null;
+				}
+			}
+
+			await db
+				.insert(schema.conversations)
+				.values({
+					uuid: convUuid,
 					name: conv.name || "",
 					summary: conv.summary || "",
 					model: conv.model || null,
+					created_at:
+						conv.created_at instanceof Date
+							? conv.created_at.toISOString()
+							: conv.created_at || now,
 					updated_at:
 						conv.updated_at instanceof Date
 							? conv.updated_at.toISOString()
 							: conv.updated_at || now,
 					settings: conv.settings || {},
-					is_starred: conv.is_starred,
+					is_starred: !!conv.is_starred,
 					current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
 					project_uuid: conv.project_uuid || null,
-				},
-			});
-
-		if (conv.chat_messages) {
-			for (const msg of conv.chat_messages) {
-				await db
-					.insert(schema.messages)
-					.values({
-						uuid: msg.uuid,
-						conversation_uuid: conv.uuid,
-						text: msg.text || "",
-						sender: msg.sender || "unknown",
-						index: msg.index || 0,
-						created_at:
-							msg.created_at instanceof Date
-								? msg.created_at.toISOString()
-								: msg.created_at || now,
-						updated_at:
-							msg.updated_at instanceof Date
-								? msg.updated_at.toISOString()
-								: msg.updated_at || now,
-						truncated: msg.truncated,
-						stop_reason: msg.stop_reason || null,
-						parent_message_uuid: msg.parent_message_uuid,
+				})
+				.onConflictDoUpdate({
+					target: schema.conversations.uuid,
+					set: {
+						name: conv.name || "",
+						summary: conv.summary || "",
 						model: conv.model || null,
-					})
-					.onConflictDoUpdate({
-						target: schema.messages.uuid,
-						set: {
-							text: msg.text || "",
-							sender: msg.sender || "unknown",
-							index: msg.index || 0,
-							updated_at:
-								msg.updated_at instanceof Date
-									? msg.updated_at.toISOString()
-									: msg.updated_at || now,
-							truncated: msg.truncated,
-							stop_reason: msg.stop_reason || null,
-							parent_message_uuid: msg.parent_message_uuid || "",
+						updated_at:
+							conv.updated_at instanceof Date
+								? conv.updated_at.toISOString()
+								: conv.updated_at || now,
+						settings: conv.settings || {},
+						is_starred: !!conv.is_starred,
+						current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
+						project_uuid: conv.project_uuid || null,
+					},
+				});
+		} catch (error) {
+			console.error(`Error inserting/updating conversation ${convUuid}:`, error);
+
+			// Try again without the project reference if it's a foreign key error
+			if (error.toString().includes('FOREIGN KEY constraint failed') && conv.project_uuid) {
+				try {
+					console.log(`Retrying conversation ${convUuid} without project reference`);
+
+					await db
+						.insert(schema.conversations)
+						.values({
+							uuid: convUuid,
+							name: conv.name || "",
+							summary: conv.summary || "",
 							model: conv.model || null,
-						},
-					});
+							created_at:
+								conv.created_at instanceof Date
+									? conv.created_at.toISOString()
+									: conv.created_at || now,
+							updated_at:
+								conv.updated_at instanceof Date
+									? conv.updated_at.toISOString()
+									: conv.updated_at || now,
+							settings: conv.settings || {},
+							is_starred: !!conv.is_starred,
+							current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
+							project_uuid: null, // Set project_uuid to null to avoid foreign key error
+						})
+						.onConflictDoUpdate({
+							target: schema.conversations.uuid,
+							set: {
+								name: conv.name || "",
+								summary: conv.summary || "",
+								model: conv.model || null,
+								updated_at:
+									conv.updated_at instanceof Date
+										? conv.updated_at.toISOString()
+										: conv.updated_at || now,
+								settings: conv.settings || {},
+								is_starred: !!conv.is_starred,
+								current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
+								project_uuid: null, // Set project_uuid to null to avoid foreign key error
+							},
+						});
+
+					console.log(`Successfully inserted/updated conversation ${convUuid} without project reference`);
+				} catch (retryError) {
+					console.error(`Failed retry for conversation ${convUuid}:`, retryError);
+				}
+			}
+		}
+
+		// Process messages if they exist
+		if (conv.chat_messages && Array.isArray(conv.chat_messages)) {
+			for (const msg of conv.chat_messages) {
+				if (!msg.uuid) {
+					console.warn("Skipping message without UUID");
+					continue;
+				}
+
+				try {
+					// First check if this message already exists
+					const existingMsg = await db
+						.select({ count: sql`count(*)` })
+						.from(schema.messages)
+						.where(eq(schema.messages.uuid, msg.uuid));
+
+					const exists = existingMsg[0]?.count > 0;
+
+					if (exists) {
+						// Update existing message
+						await db
+							.update(schema.messages)
+							.set({
+								text: msg.text || "",
+								sender: msg.sender || "unknown",
+								updated_at:
+									msg.updated_at instanceof Date
+										? msg.updated_at.toISOString()
+										: msg.updated_at || now,
+								truncated: msg.truncated || false,
+								stop_reason: msg.stop_reason || null,
+								parent_message_uuid: msg.parent_message_uuid || "",
+								model: conv.model || null,
+							})
+							.where(eq(schema.messages.uuid, msg.uuid));
+					} else {
+						// Find max index to avoid conflicts
+						const highestIndex = await db
+							.select({
+								maxIndex: sql`max(${schema.messages.index})`.as('maxIndex')
+							})
+							.from(schema.messages)
+							.where(eq(schema.messages.conversation_uuid, convUuid));
+
+						const nextIndex = (highestIndex[0]?.maxIndex || 0) + 1;
+
+						// Create new message
+						await db
+							.insert(schema.messages)
+							.values({
+								uuid: msg.uuid,
+								conversation_uuid: convUuid,
+								text: msg.text || "",
+								sender: msg.sender || "unknown",
+								index: nextIndex, // Use calculated index to avoid conflicts
+								created_at:
+									msg.created_at instanceof Date
+										? msg.created_at.toISOString()
+										: msg.created_at || now,
+								updated_at:
+									msg.updated_at instanceof Date
+										? msg.updated_at.toISOString()
+										: msg.updated_at || now,
+								truncated: msg.truncated || false,
+								stop_reason: msg.stop_reason || null,
+								parent_message_uuid: msg.parent_message_uuid || "",
+								model: conv.model || null,
+							});
+					}
+				} catch (messageError) {
+					console.error(`Error processing message ${msg.uuid}:`, messageError);
+				}
 			}
 		}
 	}
 }
+
+
+
 
 const loggerColors = {
 	info: Bun.color("blue", "ansi"),
@@ -661,35 +705,94 @@ Bun.serve<WebSocketData>({
 
 		async message(ws, raw) {
 			const release = await messageMutex.acquire();
-			const payload = JSON.parse(raw.toString()) as Payload;
-			log("info", ` - [WS] - ${payload.type}`);
-			const { conversation_uuid, endpoint, url, type } = payload;
-			const { content } = payload;
-			const now = new Date().toISOString();
+			let payload: Payload;
 
 			try {
+				payload = JSON.parse(raw.toString()) as Payload;
+			} catch (error) {
+				log("error", `Error parsing message: ${error instanceof Error ? error.message : String(error)}`);
+				release();
+				return;
+			}
+
+			log("info", ` - [WS] - ${payload.type}`);
+			const { conversation_uuid, type } = payload;
+			const { content } = payload;
+			const now = new Date().toISOString();
+			try {
 				switch (content.type) {
-					case "conversation_title":
-						await db
-							.update(schema.conversations)
-							.set({
-								name: content.title,
-							})
-							.where(eq(schema.conversations.uuid, conversation_uuid));
-						// Broadcast title change to all conversation participants
-						broadcastToConversation(conversation_uuid, {
-							type: "conversation_title_updated",
-							title: content.title,
-						});
+
+					// Basic website interaction events
+					case "conversation_title": {
+						// Validate the title and conversation exists
+						try {
+							if (!conversation_uuid) {
+								console.error("No conversation UUID provided for title update");
+								break;
+							}
+
+							// Make sure we have a title value
+							const titleValue = content.title !== undefined ? content.title : "";
+
+							// First check if the conversation exists
+							const existingConv = await db
+								.select({ count: sql`count(*)` })
+								.from(schema.conversations)
+								.where(eq(schema.conversations.uuid, conversation_uuid));
+
+							if (existingConv[0]?.count === 0) {
+								// Conversation doesn't exist, create it
+								await db
+									.insert(schema.conversations)
+									.values({
+										uuid: conversation_uuid,
+										name: titleValue,
+										created_at: now,
+										updated_at: now
+									});
+
+								console.log(`Created new conversation with title "${titleValue}"`);
+							} else {
+								// Update existing conversation
+								await db
+									.update(schema.conversations)
+									.set({ name: titleValue })
+									.where(eq(schema.conversations.uuid, conversation_uuid));
+							}
+
+							// Broadcast title change to all conversation participants
+							broadcastToConversation(conversation_uuid, {
+								type: "conversation_title_updated",
+								title: titleValue,
+							});
+						} catch (error) {
+							console.error(`Failed to update conversation title:`, error);
+						}
 						break;
+					}
+
+
+
 					case "conversations_list":
+						// Better handling of undefined/null data
+						if (!content.data) {
+							console.log("[DEBUG] Handling conversations_list with no data");
+							break;
+						}
+
 						console.log(
 							"[DEBUG] Handling conversations_list with",
-							content.data.length,
+							Array.isArray(content.data) ? content.data.length : "non-array",
 							"items"
 						);
-						await handleConversationData(conversation_uuid, content.data);
+
+						try {
+							await handleConversationData(conversation_uuid || "default", content.data);
+						} catch (error) {
+							console.error("Error handling conversations list:", error);
+						}
 						break;
+
 
 					case "conversation_detail": {
 						console.log(
@@ -698,6 +801,7 @@ Bun.serve<WebSocketData>({
 						);
 						await handleConversationData(conversation_uuid, [content.data]);
 						ws.data.activeConversation = content.data.uuid;
+
 						// Update client tracking
 						const client = clients.get(ws.data.clientId);
 						if (client) {
@@ -707,58 +811,118 @@ Bun.serve<WebSocketData>({
 						break;
 					}
 
+					// Claude SSE event handling
 					case "message_start": {
-						// Initialize new message tracking
-						// Get or create sketch writer for this conversation
-						await sketchManager.writeMessageStart(
-							conversation_uuid,
-							content.message.uuid
-						);
-						ws.data.currentMessage = {
-							id: content.message.uuid,
-							conversation_uuid: conversation_uuid,
-							contentBlocks: [],
-							model: content.message.model,
-							artifacts: [],
-							created_at: new Date().toISOString(),
-							currentBlockIndex: 0,
-							activeCodeBlock: false,
-							blockTracker: {
-								index: 0,
-								type: ContentType.Text,
-								textContent: "",
-								currentBlocks: new Map(),
-								toolRelationships: new Map(),
-							},
-						};
+						// Validate conversation UUID
+						try {
+							if (!conversation_uuid) {
+								console.error("No conversation UUID provided for message creation");
+								break;
+							}
 
-						// Create initial message record
-						await db.insert(schema.messages).values({
-							uuid: content.message.uuid,
-							conversation_uuid: conversation_uuid,
-							model: content.message.model,
-							sender: "assistant",
-							created_at: now,
-							updated_at: now,
-						});
+							// Check if conversation exists, create if needed
+							const existingConv = await db
+								.select({ count: sql`count(*)` })
+								.from(schema.conversations)
+								.where(eq(schema.conversations.uuid, conversation_uuid));
 
+							if (existingConv[0]?.count === 0) {
+								// Create a minimal conversation record
+								await db
+									.insert(schema.conversations)
+									.values({
+										uuid: conversation_uuid,
+										name: "New conversation",
+										created_at: now,
+										updated_at: now
+									});
+
+								console.log(`Created new conversation ${conversation_uuid} for message`);
+							}
+
+							// Initialize new message tracking
+							const messageUUID = content.message.uuid;
+							await sketchManager.writeMessageStart(
+								conversation_uuid,
+								messageUUID
+							);
+
+							ws.data.currentMessage = {
+								id: messageUUID,
+								conversation_uuid: conversation_uuid,
+								contentBlocks: [],
+								model: content.message.model || "",
+								artifacts: [],
+								created_at: now,
+								currentBlockIndex: 0,
+								activeCodeBlock: false,
+								blockTracker: {
+									index: 0,
+									type: ContentType.Text,
+									textContent: "",
+									currentBlocks: new Map(),
+									toolRelationships: new Map(),
+								},
+							};
+
+							// Find the next available index for this message
+							const highestIndex = await db
+								.select({
+									maxIndex: sql`max(${schema.messages.index})`.as('maxIndex')
+								})
+								.from(schema.messages)
+								.where(eq(schema.messages.conversation_uuid, conversation_uuid));
+
+							const nextIndex = (highestIndex[0]?.maxIndex || 0) + 1;
+
+							// Create initial message record
+							await db.insert(schema.messages).values({
+								uuid: messageUUID,
+								conversation_uuid: conversation_uuid,
+								model: content.message.model || null,
+								sender: "assistant",
+								text: "",
+								index: nextIndex,
+								created_at: now,
+								updated_at: now,
+								parent_message_uuid: content.message.parent_uuid || "",
+								truncated: false,
+							});
+
+							console.log(`Created new message ${messageUUID} with index ${nextIndex}`);
+						} catch (error) {
+							console.error(`Failed to create message:`, error);
+							ws.data.currentMessage = null;
+						}
 						break;
 					}
 
+
+
 					case "message_delta": {
-						if (ws.data.currentMessage?.blockTracker) {
-							// Iterate through Map entries properly
-							for (const [toolUseId, rel] of ws.data.currentMessage.blockTracker
-								.toolRelationships) {
-								if (rel.status === "success") {
-									await db
-										.update(schema.artifacts)
-										.set({
-											status: "final",
-											updated_at: new Date().toISOString(),
-										})
-										.where(eq(schema.artifacts.tool_use_id, toolUseId));
-								}
+						if (!ws.data.currentMessage) break;
+
+						// Handle update to message metadata like stop_reason
+						if (content.delta?.stop_reason) {
+							await db
+								.update(schema.messages)
+								.set({
+									stop_reason: content.delta.stop_reason,
+									updated_at: now,
+								})
+								.where(eq(schema.messages.uuid, ws.data.currentMessage.id));
+						}
+
+						// Check for successful tool calls and finalize their artifacts
+						for (const [toolUseId, rel] of ws.data.currentMessage.blockTracker.toolRelationships.entries()) {
+							if (rel.status === "success") {
+								await db
+									.update(schema.artifacts)
+									.set({
+										status: "final",
+										updated_at: now,
+									})
+									.where(eq(schema.artifacts.tool_use_id, toolUseId));
 							}
 						}
 						break;
@@ -792,30 +956,44 @@ Bun.serve<WebSocketData>({
 							);
 						}
 
+						// Determine block type and tool ID
+						const blockType = content.content_block.type as ContentType;
+						const contentBlock = content.content_block;
+
+						const toolUseId =
+							blockType === ContentType.ToolUse
+								? contentBlock.id || `tool_${crypto.randomUUID()}`
+								: blockType === ContentType.ToolResult
+									? contentBlock.tool_use_id || undefined
+									: undefined;
+
 						// Initialize new block
 						const newBlock = {
 							index: blockIndex,
-							type: content.content_block.type as ContentType,
+							type: blockType,
 							textContent: "",
-							toolUseId:
-								content.content_block.type === ContentType.ToolUse
-									? content.content_block.id || `tool_${crypto.randomUUID()}`
-									: undefined,
+							toolUseId: toolUseId,
 							toolResult: undefined,
 							fragments: [],
 							status: "pending" as const,
 							replacedBy: undefined,
-							is_error: false,
+							is_error: 'is_error' in contentBlock ? !!contentBlock.is_error : false,
 						};
 
 						tracker.currentBlocks.set(blockIndex, newBlock);
 
 						// Track tool relationships
-						if (newBlock.toolUseId) {
+						if (blockType === ContentType.ToolUse && newBlock.toolUseId) {
 							tracker.toolRelationships.set(newBlock.toolUseId, {
 								toolUseIndex: blockIndex,
 								status: "pending",
 							});
+						} else if (blockType === ContentType.ToolResult && newBlock.toolUseId) {
+							const relationship = tracker.toolRelationships.get(newBlock.toolUseId);
+							if (relationship) {
+								relationship.toolResultIndex = blockIndex;
+								relationship.status = newBlock.is_error ? "error" : "success";
+							}
 						}
 
 						await sketchManager.writeBlockHeader(
@@ -845,7 +1023,8 @@ Bun.serve<WebSocketData>({
 							updatedAt: now,
 						};
 
-						if (content.delta?.type === "text_delta") {
+						// Handle text delta
+						if (content.delta?.type === "text_delta" && content.delta.text) {
 							await db.insert(schema.messageContents).values({
 								...baseValues,
 								contentType: ContentType.Text,
@@ -860,7 +1039,8 @@ Bun.serve<WebSocketData>({
 							);
 						}
 
-						if (content.delta?.type === "input_json_delta") {
+						// Handle JSON delta for tool uses
+						if (content.delta?.type === "input_json_delta" && content.delta.partial_json) {
 							await db.insert(schema.messageContents).values({
 								...baseValues,
 								contentType: ContentType.ToolUse,
@@ -898,7 +1078,12 @@ Bun.serve<WebSocketData>({
 							await db
 								.update(schema.messageContents)
 								.set({ isComplete: true })
-								.where(eq(schema.messageContents.blockIndex, blockIndex));
+								.where(
+									and(
+										eq(schema.messageContents.messageUuid, ws.data.currentMessage.id),
+										eq(schema.messageContents.blockIndex, blockIndex)
+									)
+								);
 						}
 
 						// Handle tool use completion
@@ -915,7 +1100,12 @@ Bun.serve<WebSocketData>({
 											isComplete: true,
 											toolResult: null,
 										})
-										.where(eq(schema.messageContents.blockIndex, blockIndex));
+										.where(
+											and(
+												eq(schema.messageContents.messageUuid, ws.data.currentMessage!.id),
+												eq(schema.messageContents.blockIndex, blockIndex)
+											)
+										);
 
 									await tx.insert(schema.artifacts).values({
 										id: parsed.id,
@@ -937,9 +1127,10 @@ Bun.serve<WebSocketData>({
 								await sketchManager.writeDeltaContent(
 									conversation_uuid,
 									blockIndex,
-									`\n\`\`\`${parsed.language}\n${parsed.content}\n\`\`\`\n`
+									`\n\`\`\`${parsed.language || 'json'}\n${parsed.content}\n\`\`\`\n`
 								);
 							} catch (error) {
+								log("error", `Error processing tool use block: ${error instanceof Error ? error.message : String(error)}`);
 								await sketchManager.writeDeltaContent(
 									conversation_uuid,
 									blockIndex,
@@ -950,11 +1141,16 @@ Bun.serve<WebSocketData>({
 								await db
 									.update(schema.messageContents)
 									.set({ isComplete: false })
-									.where(eq(schema.messageContents.blockIndex, blockIndex));
+									.where(
+										and(
+											eq(schema.messageContents.messageUuid, ws.data.currentMessage!.id),
+											eq(schema.messageContents.blockIndex, blockIndex)
+										)
+									);
 							}
 						}
 
-						// Handle tool results (modified to use block type instead ofcontent.content_block)
+						// Handle tool results
 						if (block.type === ContentType.ToolResult) {
 							const relationship =
 								ws.data.currentMessage.blockTracker.toolRelationships.get(
@@ -981,7 +1177,12 @@ Bun.serve<WebSocketData>({
 											toolResult: block.fragments.join(""),
 											toolUseId: block.toolUseId,
 										})
-										.where(eq(schema.messageContents.blockIndex, blockIndex));
+										.where(
+											and(
+												eq(schema.messageContents.messageUuid, ws.data.currentMessage!.id),
+												eq(schema.messageContents.blockIndex, blockIndex)
+											)
+										);
 								});
 							}
 						}
@@ -991,6 +1192,7 @@ Bun.serve<WebSocketData>({
 					case "message_stop": {
 						if (!ws.data.currentMessage) break;
 						const conversationUUID = ws.data.currentMessage.conversation_uuid;
+						const messageId = ws.data.currentMessage.id;
 
 						// Finalize all blocks and relationships
 						await db.transaction(async (tx) => {
@@ -1000,7 +1202,12 @@ Bun.serve<WebSocketData>({
 								if (block.status !== "valid") {
 									await tx
 										.delete(schema.messageContents)
-										.where(eq(schema.messageContents.blockIndex, index));
+										.where(
+											and(
+												eq(schema.messageContents.messageUuid, ws.data.currentMessage!.id),
+												eq(schema.messageContents.blockIndex, index)
+											)
+										);
 
 									if (block.toolUseId) {
 										await tx
@@ -1018,15 +1225,12 @@ Bun.serve<WebSocketData>({
 								.from(schema.messageContents)
 								.where(
 									and(
-										eq(
-											schema.messageContents.messageUuid,
-											ws.data.currentMessage!.id
-										),
-										eq(schema.messageContents.contentType, ContentType.Text),
+										eq(schema.messageContents.messageUuid, messageId),
+										eq(schema.messageContents.contentType, "text" as ContentType),
 										eq(schema.messageContents.isComplete, true)
 									)
 								)
-								.orderBy(asc(schema.messageContents.blockIndex));
+								.orderBy(schema.messageContents.blockIndex);
 
 							const fullText = textBlocks.map((b) => b.textContent).join("\n");
 
@@ -1036,148 +1240,118 @@ Bun.serve<WebSocketData>({
 								.set({
 									text: fullText,
 									updated_at: now,
-									stop_reason: content.stop_reason,
+									stop_reason: 'stop_reason' in content ? content.stop_reason : StopReason.StopSequence,
 								})
 								.where(eq(schema.messages.uuid, ws.data.currentMessage!.id));
+
+							// Update conversation record with this as current leaf
+							await tx
+								.update(schema.conversations)
+								.set({
+									current_leaf_message_uuid: ws.data.currentMessage!.id,
+									updated_at: now,
+								})
+								.where(eq(schema.conversations.uuid, conversationUUID));
 						});
 
 						// Finalize sketch file
 						await sketchManager.writeMessageCompletion(
 							conversationUUID,
-							ws.data.currentMessage.id
+							messageId
 						);
 
 						broadcastToConversation(conversationUUID, {
 							type: "message_completed",
-							messageId: ws.data.currentMessage.id,
+							messageId: messageId,
 						});
 
-						// await sketchWriter.end();
 						ws.data.currentMessage = null;
-						// Broadcast message completion
+						break;
+					}
+
+					case "message_limit": {
+						if (!ws.data.currentMessage) break;
+
+						// Handle message limit reached
+						const conversationUUID = ws.data.currentMessage.conversation_uuid;
+						const messageId = ws.data.currentMessage.id;
+
+						// Add a note about the limit in the sketch
+						await sketchManager.writeContentBlock(conversationUUID, {
+							index: -2, // Special index for limit notes
+							type: ContentType.Text,
+							content: `\n<!-- MESSAGE LIMIT REACHED: ${content.message_limit?.type || 'unknown'} -->\n`,
+						});
+
+						// Update database record with appropriate stop reason
+						await db
+							.update(schema.messages)
+							.set({
+								updated_at: now,
+								stop_reason: StopReason.MaxTokens,
+							})
+							.where(eq(schema.messages.uuid, messageId));
+
+						// Broadcast limit notification
+						broadcastToConversation(conversationUUID, {
+							type: "message_limit_reached",
+							messageId: messageId,
+							limitType: content.message_limit?.type || 'unknown',
+						});
 
 						break;
 					}
 
-					case "message_limit":
+					case "ping": {
+						// Just a heartbeat, no action needed
 						break;
-						// biome-ignore lint/correctness/noUnreachable: <explanation>
-						if (ws.data.currentMessage) {
-							const writer = await sketchManager.getWriter(conversation_uuid);
-							await sketchManager.writeContentBlock(conversation_uuid, {
-								index: -2, // Special index for timestamp
-								type: ContentType.Text,
-								content: `\n_Generated at: ${now}_\n`,
-							});
-
-							const textBlocks = Array.from(
-								ws.data.currentMessage.blockTracker.currentBlocks.values()
-							)
-								.filter((b) => b.type === "text")
-								.sort((a, b) => a.index - b.index);
-
-							for (const block of textBlocks) {
-								await writer.write(block.textContent);
-							}
-
-							// Write timestamp and close
-							await writer.write(`\n_Generated at: ${now}_\n`);
-							// await sketchWriter.end();
-
-							const fullContent: ChatMessageContent[] =
-								ws.data.currentMessage.contentBlocks.map((block) => {
-									if (block.type === ContentType.ToolResult) {
-										return {
-											type: ContentType.ToolResult,
-											content: [
-												{
-													type: ContentType.Text,
-													text: block.content,
-												},
-											],
-											is_error: false,
-										};
-									}
-
-									if (block.type === ContentType.ToolUse && block.jsonParts) {
-										try {
-											const parsed = JSON.parse(block.jsonParts.join(""));
-											return {
-												type: ContentType.ToolUse,
-												name: "artifacts",
-												input: {
-													id: parsed.id,
-													version_uuid: parsed.version_uuid || "",
-													content: parsed.content,
-													language: parsed.language,
-													type: parsed.type as InputType,
-													command: parsed.command,
-												},
-											};
-										} catch (error) {
-											return {
-												type: ContentType.Text,
-												text: "Invalid tool use content",
-												is_error: true,
-											};
-										}
-									}
-
-									return {
-										type: ContentType.Text,
-										text: block.content,
-									};
-								});
-
-							await db
-								.update(schema.messages)
-								.set({
-									updated_at: now,
-									stop_reason: content.stop_reason || StopReason.StopSequence,
-								})
-								.where(eq(schema.messages.uuid, ws.data.currentMessage.id));
-
-							ws.data.currentMessage = null;
-						}
-						break;
-
-					// case "artifact":
-					// 	await db
-					// 		.insert(schema.artifacts)
-					// 		.values({
-					// 			id: data.id,
-					// 			conversation_uuid: data.conversation_uuid,
-					// 			version_uuid: data.version_uuid || null,
-					// 			type: data.type || null,
-					// 			title: data.title || null,
-					// 			content: data.content,
-					// 			language: data.language || null,
-					// 		})
-					// 		.onConflictDoUpdate({
-					// 			target: schema.artifacts.id,
-					// 			set: {
-					// 				version_uuid: data.version_uuid || null,
-					// 				type: data.type || null,
-					// 				title: data.title || null,
-					// 				content: data.content,
-					// 				language: data.language || null,
-					// 			},
-					// 		});
-					// 	break;
+					}
 
 					default:
-						console.warn("Unhandled event type:", type);
+						console.warn("Unhandled event type:", type, content.type);
 				}
 			} catch (error) {
 				console.error(
 					"Message handling error:",
 					error instanceof Error ? error.message : String(error),
 					type,
-					content,
-					conversation_uuid,
-					endpoint,
-					url
+					content?.type || "unknown content type",
+					conversation_uuid
 				);
+
+				// Try to recover message state if possible
+				if (ws.data.currentMessage) {
+					try {
+						// Mark any pending artifacts as invalid
+						for (const [toolUseId, rel] of ws.data.currentMessage.blockTracker.toolRelationships.entries()) {
+							if (rel.status === "pending") {
+								await db
+									.update(schema.artifacts)
+									.set({
+										status: "invalid",
+										updated_at: now,
+									})
+									.where(eq(schema.artifacts.tool_use_id, toolUseId));
+							}
+						}
+
+						// Add error note to the sketch
+						await sketchManager.writeContentBlock(
+							ws.data.currentMessage.conversation_uuid,
+							{
+								index: -3, // Special index for error notes
+								type: ContentType.Text,
+								content: `\n<!-- ERROR PROCESSING EVENT: ${type}, ${content?.type} -->\n`,
+							}
+						);
+					} catch (recoveryError) {
+						console.error(
+							"Error during recovery:",
+							recoveryError instanceof Error ? recoveryError.message : String(recoveryError)
+						);
+					}
+				}
+
 				ws.data.currentMessage = null;
 			} finally {
 				release();

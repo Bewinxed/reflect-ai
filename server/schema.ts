@@ -20,8 +20,8 @@ export const conversations = sqliteTable(
 	'conversations',
 	{
 		uuid: text('uuid').primaryKey(),
-		name: text('name'),
-		summary: text('summary'),
+		name: text('name').default(''),
+		summary: text('summary').default(''),
 		model: text('model'),
 		created_at: text('created_at')
 			.notNull()
@@ -36,11 +36,10 @@ export const conversations = sqliteTable(
 			enabled_artifacts_attachments: boolean | null;
 			enabled_turmeric: null;
 			paprika_mode: null;
-		}>(),
-		is_starred: integer('is_starred', { mode: 'boolean' }),
-		current_leaf_message_uuid: text('current_leaf_message_uuid'), // Remove foreign key
-
-		project_uuid: text('project_uuid').references(() => projects.uuid),
+		}>().default({}),
+		is_starred: integer('is_starred', { mode: 'boolean' }).default(false),
+		current_leaf_message_uuid: text('current_leaf_message_uuid'),
+		project_uuid: text('project_uuid').references(() => projects.uuid, { onDelete: 'set null' }),
 	},
 	(t) => [index('starred_idx').on(t.is_starred)]
 );
@@ -50,24 +49,25 @@ export const messages = sqliteTable(
 	{
 		uuid: text('uuid').primaryKey(),
 		conversation_uuid: text('conversation_uuid').references(
-			(): AnySQLiteColumn => conversations.uuid
+			(): AnySQLiteColumn => conversations.uuid, { onDelete: 'cascade' }
 		),
-		text: text('text'),
-		sender: text('sender').$type<string>(),
-		index: integer('index'),
+		text: text('text').default(''),
+		sender: text('sender').$type<string>().default('assistant'),
+		index: integer('index').default(0),
 		created_at: text('created_at')
 			.notNull()
 			.$defaultFn(() => new Date().toISOString()),
 		updated_at: text('updated_at')
 			.notNull()
 			.$defaultFn(() => new Date().toISOString()),
-		truncated: integer('truncated', { mode: 'boolean' }),
+		truncated: integer('truncated', { mode: 'boolean' }).default(false),
 		stop_reason: text('stop_reason').$type<string>(),
-		parent_message_uuid: text('parent_message_uuid'),
+		parent_message_uuid: text('parent_message_uuid').default(''),
 		model: text('model'),
 	},
 	(t) => [
-		unique('message_order').on(t.conversation_uuid, t.index),
+		// Changed to index instead of unique to avoid conflicts
+		index('message_order_idx').on(t.conversation_uuid, t.index),
 		index('parent_idx').on(t.parent_message_uuid),
 	]
 );
@@ -76,11 +76,11 @@ export const attachments = sqliteTable(
 	'attachments',
 	{
 		id: text('id').primaryKey(),
-		message_uuid: text('message_uuid').references(() => messages.uuid),
-		file_name: text('file_name'),
-		file_size: integer('file_size'),
-		file_type: text('file_type'),
-		extracted_content: text('extracted_content'),
+		message_uuid: text('message_uuid').references(() => messages.uuid, { onDelete: 'cascade' }),
+		file_name: text('file_name').default(''),
+		file_size: integer('file_size').default(0),
+		file_type: text('file_type').default(''),
+		extracted_content: text('extracted_content').default(''),
 		created_at: text('created_at')
 			.notNull()
 			.$defaultFn(() => new Date().toISOString()),
@@ -96,13 +96,13 @@ export const artifacts = sqliteTable(
 			.notNull()
 			.$defaultFn(() => crypto.randomUUID()),
 		conversation_uuid: text('conversation_uuid').references(
-			() => conversations.uuid
+			() => conversations.uuid, { onDelete: 'cascade' }
 		),
 		type: text('type'),
 		title: text('title'),
-		content: text('content').notNull(),
+		content: text('content').notNull().default(''),
 		language: text('language'),
-		message_uuid: text('message_uuid').references(() => messages.uuid),
+		message_uuid: text('message_uuid').references(() => messages.uuid, { onDelete: 'set null' }),
 		status: text('status', { enum: ['draft', 'valid', 'invalid', 'final'] })
 			.notNull()
 			.default('draft'),
@@ -126,7 +126,7 @@ export const messageContents = sqliteTable(
 	{
 		id: text('id').primaryKey(),
 		messageUuid: text('message_uuid')
-			.references(() => messages.uuid)
+			.references(() => messages.uuid, { onDelete: 'cascade' })
 			.notNull(),
 		blockIndex: integer('block_index').notNull(),
 		fragmentSequence: integer('fragment_sequence').notNull(),
