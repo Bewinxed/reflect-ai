@@ -1,9 +1,17 @@
 // wxt.config.ts
 import { defineConfig } from 'wxt';
+import { resolve } from 'path';
+import { fileURLToPath } from 'url';
 
 export default defineConfig({
 	entrypointsDir: 'src/entrypoints',
 	manifestVersion: 3,
+	runner: {
+		binaries: {
+			"chrome": "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+		},
+
+	},
 	// vite: (env) => ({
 	// 	server: {
 	// 		port: 3001,

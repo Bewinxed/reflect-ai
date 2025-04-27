@@ -1,4 +1,4 @@
-import type { SSEEvent, SSEMessage } from "../../../types/claudeSSE";
+import type { SSEEvent, SSEMessage } from "../../../types/claude";
 import type { Payload } from "../../../types/common";
 // Types for debug messages
 interface DebugMessage {
@@ -153,9 +153,9 @@ function initializeInterceptors() {
 			input instanceof URL
 				? input
 				: new URL(
-						typeof input === "string" ? input : input.url,
-						window.location.origin
-				  );
+					typeof input === "string" ? input : input.url,
+					window.location.origin
+				);
 
 		if (
 			url.pathname.includes("/api/organizations/") &&

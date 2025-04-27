@@ -1,0 +1,39 @@
+{
+	"folders": [
+		{
+			"name": "reflect",
+			"path": "."
+		}
+	],
+	"settings": {},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": [
+			{
+				"name": "Run Extension Dev Server",
+				"type": "node",
+				"request": "launch",
+				
+				"runtimeExecutable": "npm",
+				"runtimeArgs": ["run", "dev"],
+				"cwd": "${workspaceFolder}/extension",
+				"console": "integratedTerminal"
+			},
+			{
+				"name": "Run Host Server",
+				"type": "node",
+				"request": "launch",
+				"runtimeExecutable": "npm",
+				"runtimeArgs": ["run", "dev"],
+				"cwd": "${workspaceFolder}/server",
+				"console": "integratedTerminal"
+			}
+		],
+		"compounds": [
+			{
+				"name": "Run Both Servers",
+				"configurations": ["Run Extension Dev Server", "Run Host Server"]
+			}
+		]
+	}
+}

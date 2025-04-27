@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Extension Dev Server",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/node_modules/.bin/wxt",
+      "args": ["dev"],
+      "cwd": "${workspaceFolder}/extension",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Run Host Server",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/server/index.ts",
+      "runtimeExecutable": "bun",
+      "cwd": "${workspaceFolder}/server",
+      "console": "integratedTerminal"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Run Both Servers",
+      "configurations": ["Run Extension Dev Server", "Run Host Server"]
+    }
+  ]
+}

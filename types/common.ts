@@ -1,10 +1,27 @@
-import type { SSEEvent } from "./claudeSSE";
+// types/common.ts
 import type { ClaudeEvent } from "./claude";
 
+/**
+ * Represents the overall structure of the WebSocket message payload
+ * received from the Chrome extension.
+ */
 export type Payload = {
-	type: SSEEvent["type"] | ClaudeEvent["type"];
-	content: SSEEvent | ClaudeEvent;
+	/**
+	 * The type of the event contained within the 'content' field.
+	 * This seems redundant as `content.type` is the primary discriminator used.
+	 * Kept for potential compatibility but recommend relying on `content.type`.
+	 */
+	type: ClaudeEvent["type"];
+
+	/** The actual event data, conforming to one of the ClaudeEvent types. */
+	content: ClaudeEvent;
+
+	/** The UUID of the conversation this payload relates to. */
 	conversation_uuid: string;
+
+	/** The API endpoint the extension intercepted (informational). */
 	endpoint: string;
+
+	/** The full URL the extension intercepted (informational). */
 	url: string;
 };
