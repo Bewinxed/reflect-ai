@@ -319,46 +319,6 @@ class SketchManager {
 	}
 }
 
-/**
- * Ensure a project exists before referencing it
- * @param projectUuid The project UUID to check
- * @returns The project UUID if it exists, null otherwise
- */
-async function ensureProjectExists(projectUuid: string | null | undefined): Promise<string | null> {
-	if (!projectUuid) return null;
-
-	try {
-		const projectExists = await db
-			.select({ count: sql`count(*)` })
-			.from(schema.projects)
-			.where(eq(schema.projects.uuid, projectUuid));
-
-		if (projectExists[0]?.count > 0) {
-			return projectUuid;
-		}
-
-		// Attempt to create the project with a placeholder name
-		// This is a fallback to prevent foreign key errors
-		try {
-			await db
-				.insert(schema.projects)
-				.values({
-					uuid: projectUuid,
-					name: `Project ${projectUuid.substring(0, 8)}`,
-				});
-
-			console.log(`Created placeholder project ${projectUuid}`);
-			return projectUuid;
-		} catch (createError) {
-			console.error(`Failed to create placeholder project ${projectUuid}:`, createError);
-			return null;
-		}
-	} catch (error) {
-		console.error(`Error checking project ${projectUuid}:`, error);
-		return null;
-	}
-}
-
 interface ContentBlockTracker {
 	index: number;
 	type: ContentType;
@@ -534,7 +494,7 @@ async function handleConversationData(
 			console.error(`Error inserting/updating conversation ${convUuid}:`, error);
 
 			// Try again without the project reference if it's a foreign key error
-			if (error.toString().includes('FOREIGN KEY constraint failed') && conv.project_uuid) {
+			if ((error as Error).toString().includes('FOREIGN KEY constraint failed') && conv.project_uuid) {
 				try {
 					console.log(`Retrying conversation ${convUuid} without project reference`);
 
