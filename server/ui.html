@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OpenAI Compatible Chat (React)</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+          Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+        line-height: 1.6;
+      }
+      .container {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+      .chat-container {
+        flex-grow: 1;
+        overflow-y: auto;
+        border: 1px solid #e1e1e1;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 16px;
+        background-color: #f9f9f9;
+      }
+      .input-container {
+        display: flex;
+        gap: 8px;
+      }
+      .message {
+        margin-bottom: 16px;
+        padding: 12px;
+        border-radius: 8px;
+      }
+      .user {
+        background-color: #e1f5fe;
+        align-self: flex-end;
+      }
+      .assistant {
+        background-color: #f1f1f1;
+        align-self: flex-start;
+      }
+      #prompt-input {
+        flex-grow: 1;
+        padding: 12px;
+        border: 1px solid #e1e1e1;
+        border-radius: 8px;
+        font-size: 16px;
+      }
+      button {
+        padding: 12px 24px;
+        background-color: #4caf50;
+        color: white;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 16px;
+      }
+      button:hover {
+        background-color: #388e3c;
+      }
+      button:disabled {
+        background-color: #9e9e9e;
+        cursor: not-allowed;
+      }
+      .settings {
+        margin-bottom: 16px;
+        padding: 16px;
+        border: 1px solid #e1e1e1;
+        border-radius: 8px;
+      }
+      input,
+      select {
+        padding: 8px;
+        margin-right: 8px;
+        border: 1px solid #e1e1e1;
+        border-radius: 4px;
+      }
+      label {
+        margin-right: 16px;
+      }
+      .settings-toggle {
+        text-align: right;
+        margin-bottom: 8px;
+      }
+      .hidden {
+        display: none;
+      }
+      pre {
+        white-space: pre-wrap;
+        background-color: #f5f5f5;
+        padding: 8px;
+        border-radius: 4px;
+        overflow-x: auto;
+      }
+      code {
+        font-family: 'Courier New', Courier, monospace;
+      }
+
+      .thinking-block {
+        background-color: #f8f0e3;
+        border-left: 3px solid #e9b96e;
+        padding: 8px 12px;
+        margin-bottom: 12px;
+        border-radius: 4px;
+      }
+
+      .thinking-block h4 {
+        margin-top: 0;
+        margin-bottom: 8px;
+        color: #8a6d3b;
+      }
+
+      .thinking-block pre {
+        margin: 0;
+        white-space: pre-wrap;
+        font-family: monospace;
+        background-color: transparent;
+        padding: 0;
+      }
+    </style>
+
+    <!-- Load React, ReactDOM, and Babel from CDN -->
+    <script
+      src="https://unpkg.com/react@18/umd/react.development.js"
+      crossorigin
+    ></script>
+    <script
+      src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"
+      crossorigin
+    ></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useState, useEffect, useRef } = React;
+
+      function App() {
+        // States for settings
+        const [showSettings, setShowSettings] = useState(false);
+        const [apiUrl, setApiUrl] = useState('');
+        const [apiKey, setApiKey] = useState('');
+        const [model, setModel] = useState('gpt-3.5-turbo');
+        const [temperature, setTemperature] = useState(0.7);
+
+        // States for chat
+        const [messages, setMessages] = useState([]);
+        const [inputText, setInputText] = useState('');
+        const [isLoading, setIsLoading] = useState(false);
+
+        // Refs
+        const chatContainerRef = useRef(null);
+        const inputRef = useRef(null);
+
+        // Load settings from localStorage
+        useEffect(() => {
+          if (localStorage.getItem('openai-compatible-settings')) {
+            const settings = JSON.parse(
+              localStorage.getItem('openai-compatible-settings')
+            );
+            setApiUrl(settings.apiUrl || '');
+            setApiKey(settings.apiKey || '');
+            setModel(settings.model || 'gpt-3.5-turbo');
+            setTemperature(settings.temperature || 0.7);
+          }
+
+          // Focus input on load
+          inputRef.current.focus();
+        }, []);
+
+        // Save settings when they change
+        useEffect(() => {
+          const settings = {
+            apiUrl,
+            apiKey,
+            model,
+            temperature
+          };
+          localStorage.setItem(
+            'openai-compatible-settings',
+            JSON.stringify(settings)
+          );
+        }, [apiUrl, apiKey, model, temperature]);
+
+        // Scroll to bottom of chat when messages change
+        useEffect(() => {
+          if (chatContainerRef.current) {
+            chatContainerRef.current.scrollTop =
+              chatContainerRef.current.scrollHeight;
+          }
+        }, [messages]);
+
+        const formatMessageContent = (content, thinking) => {
+          // First render thinking block if present
+          const result = [];
+          let key = 0;
+
+          if (thinking && thinking.trim() !== '') {
+            result.push(
+              <div key={`thinking-${key++}`} className="thinking-block">
+                <h4>Thinking:</h4>
+                <pre>{thinking}</pre>
+              </div>
+            );
+          }
+
+          // Handle empty content
+          if (!content || content.trim() === '') {
+            return result; // Return just the thinking block if content is empty
+          }
+
+          // Then handle normal content as before
+          if (!content.includes('```')) {
+            result.push(
+              content.split('\n').map((line, i) => (
+                <React.Fragment key={i}>
+                  {line}
+                  <br />
+                </React.Fragment>
+              ))
+            );
+            return result;
+          }
+
+          // Rest of existing code for handling code blocks
+          let inCodeBlock = false;
+          let codeContent = '';
+          let language = '';
+
+          content.split('\n').forEach((line) => {
+            if (line.startsWith('```')) {
+              if (inCodeBlock) {
+                // End of code block
+                result.push(
+                  <pre key={key++}>
+                    <code className={language}>{codeContent}</code>
+                  </pre>
+                );
+                codeContent = '';
+                inCodeBlock = false;
+              } else {
+                // Start of code block
+                language = line.slice(3).trim();
+                inCodeBlock = true;
+              }
+            } else if (inCodeBlock) {
+              codeContent += line + '\n';
+            } else {
+              result.push(
+                <React.Fragment key={key++}>
+                  {line}
+                  <br />
+                </React.Fragment>
+              );
+            }
+          });
+
+          // If still in a code block at the end
+          if (inCodeBlock) {
+            result.push(
+              <pre key={key++}>
+                <code className={language}>{codeContent}</code>
+              </pre>
+            );
+          }
+
+          return result;
+        };
+
+        // Send message to API
+        const sendMessage = async () => {
+          const prompt = inputText.trim();
+          if (!prompt) return;
+
+          if (!apiUrl) {
+            alert('Please enter an API URL in the settings');
+            setShowSettings(true);
+            return;
+          }
+
+          if (!apiKey) {
+            alert('Please enter an API key in the settings');
+            setShowSettings(true);
+            return;
+          }
+
+          // Add user message to chat
+          const updatedMessages = [
+            ...messages,
+            { role: 'user', content: prompt }
+          ];
+
+          setMessages(updatedMessages);
+          setInputText('');
+          setIsLoading(true);
+
+          try {
+            // Prepare messages for API
+            const apiMessages = updatedMessages.map((msg) => ({
+              role: msg.role,
+              content: msg.content
+            }));
+
+            // Prepare request body
+            const requestBody = {
+              model: model,
+              messages: apiMessages,
+              temperature: parseFloat(temperature),
+              stream: true
+            };
+
+            // Use fetch with streaming approach
+            const response = await fetch(apiUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${apiKey}`
+              },
+              body: JSON.stringify(requestBody)
+            });
+
+            if (!response.ok) {
+              throw new Error(
+                `API Error: ${response.status} ${response.statusText}`
+              );
+            }
+
+            // Add empty assistant message that we'll update
+            setMessages([
+              ...updatedMessages,
+              { role: 'assistant', content: '', thinking: '' }
+            ]);
+
+            // Get the reader from the response body
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let assistantContent = '';
+            let buffer = '';
+
+            // Process the stream
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              // Decode the chunk and add to buffer
+              buffer += decoder.decode(value, { stream: true });
+
+              // Process complete lines from the buffer
+              let lineEnd;
+              while ((lineEnd = buffer.indexOf('\n')) !== -1) {
+                const line = buffer.slice(0, lineEnd).trim();
+                buffer = buffer.slice(lineEnd + 1);
+
+                if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                  try {
+                    const jsonData = JSON.parse(line.substring(6));
+
+                    // Handle the chunk based on its content
+                    if (jsonData.choices && jsonData.choices[0].delta) {
+                      const delta = jsonData.choices[0].delta;
+
+                      // Handle content
+                      if (delta.content) {
+                        assistantContent += delta.content;
+
+                        // Update the assistant message
+                        setMessages((currentMessages) => {
+                          const newMessages = [...currentMessages];
+                          newMessages[newMessages.length - 1].content =
+                            assistantContent;
+                          return newMessages;
+                        });
+                      }
+
+                      // Handle tool calls with thinking content
+
+                      // Client-side handling
+                      if (delta.tool_calls) {
+                        for (const toolCall of delta.tool_calls) {
+                          if (
+                            toolCall.function &&
+                            toolCall.function.name === 'thinking'
+                          ) {
+                            // Accumulate function arguments as they come in
+                            setMessages((currentMessages) => {
+                              const newMessages = [...currentMessages];
+                              const lastMessage =
+                                newMessages[newMessages.length - 1];
+
+                              // Store the accumulated JSON string
+                              if (!lastMessage.thinkingJson) {
+                                lastMessage.thinkingJson = '';
+                              }
+
+                              // Add this chunk to the accumulated JSON
+                              lastMessage.thinkingJson +=
+                                toolCall.function.arguments || '';
+
+                              // If we've received a complete JSON (ending with '}'), parse it
+                              if (lastMessage.thinkingJson.endsWith('}')) {
+                                try {
+                                  const parsedThinking = JSON.parse(
+                                    lastMessage.thinkingJson
+                                  );
+                                  // Extract the thinking content and update the message
+                                  if (parsedThinking.thinking) {
+                                    lastMessage.thinking =
+                                      parsedThinking.thinking;
+                                  }
+                                } catch (e) {
+                                  console.error(
+                                    'Failed to parse thinking JSON:',
+                                    e
+                                  );
+                                }
+                              }
+
+                              return newMessages;
+                            });
+                          }
+                        }
+                      }
+                    }
+                  } catch (e) {
+                    console.error('Error parsing JSON from stream:', e, line);
+                  }
+                }
+              }
+            }
+
+            // Process any remaining content in the buffer
+            if (buffer.trim() && buffer.trim().startsWith('data: ')) {
+              try {
+                const jsonData = JSON.parse(buffer.trim().substring(6));
+                // Handle any final chunks (similar to above)
+              } catch (e) {
+                console.error('Error parsing final JSON chunk:', e);
+              }
+            }
+          } catch (error) {
+            console.error('Error:', error);
+            setMessages([
+              ...updatedMessages,
+              { role: 'assistant', content: `Error: ${error.message}` }
+            ]);
+          } finally {
+            setIsLoading(false);
+            inputRef.current.focus();
+          }
+        };
+
+        // Handle Enter key press
+        const handleKeyDown = (e) => {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+          }
+        };
+
+        return (
+          <div className="container">
+            <h1>OpenAI Compatible Chat (React)</h1>
+
+            <div className="settings-toggle">
+              <button onClick={() => setShowSettings(!showSettings)}>
+                {showSettings ? 'Hide Settings' : 'Show Settings'}
+              </button>
+            </div>
+
+            {showSettings && (
+              <div className="settings">
+                <h2>API Settings</h2>
+                <div>
+                  <label htmlFor="api-url">API URL:</label>
+                  <input
+                    type="text"
+                    id="api-url"
+                    placeholder="https://api.example.com/v1/chat/completions"
+                    style={{ width: '350px' }}
+                    value={apiUrl}
+                    onChange={(e) => setApiUrl(e.target.value)}
+                  />
+                </div>
+                <div style={{ marginTop: '8px' }}>
+                  <label htmlFor="api-key">API Key:</label>
+                  <input
+                    type="password"
+                    id="api-key"
+                    placeholder="Your API key"
+                    style={{ width: '350px' }}
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                  />
+                </div>
+                <div style={{ marginTop: '8px' }}>
+                  <label htmlFor="model">Model:</label>
+                  <input
+                    type="text"
+                    id="model"
+                    style={{ width: '200px' }}
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                  />
+
+                  <label htmlFor="temperature">Temperature:</label>
+                  <input
+                    type="number"
+                    id="temperature"
+                    min="0"
+                    max="2"
+                    step="0.1"
+                    style={{ width: '60px' }}
+                    value={temperature}
+                    onChange={(e) => setTemperature(parseFloat(e.target.value))}
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="chat-container" ref={chatContainerRef}>
+              {messages.map((message, index) => (
+                <div key={index} className={`message ${message.role}`}>
+                  {formatMessageContent(message.content, message.thinking)}
+                </div>
+              ))}
+            </div>
+
+            <div className="input-container">
+              <textarea
+                ref={inputRef}
+                value={inputText}
+                onChange={(e) => setInputText(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Type your message here..."
+                rows="2"
+                id="prompt-input"
+                disabled={isLoading}
+              />
+              <button onClick={sendMessage} disabled={isLoading}>
+                Send
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      // Render the React app
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(<App />);
+    </script>
+  </body>
+</html>

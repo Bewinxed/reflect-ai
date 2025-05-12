@@ -1,1323 +1,987 @@
-import { Mutex } from "async-mutex";
+import type { HTMLBundle, ServerWebSocket } from 'bun';
+import { Database } from 'bun:sqlite';
+import { drizzle } from 'drizzle-orm/bun-sqlite';
+import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
+import { EventEmitter } from 'node:events';
+import ui from './ui.html';
 
-import type { FileSink, ServerWebSocket } from "bun";
-import { Database } from "bun:sqlite";
-import { and, eq, sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import { migrate } from "drizzle-orm/bun-sqlite/migrator";
-import { mkdirSync, type PathLike } from "node:fs";
-import { ContentType, StopReason } from "../types/claude";
-import type { Payload } from "../types/common";
-import * as schema from "./schema";
+import type {
+  ChatCompletionChunk,
+  ChatCompletionMessageParam,
+  CreateChatCompletionRequestMessage
+} from 'openai/resources';
 
-// Define any server-specific types that aren't in the main type files
-interface Attachment {
-	id: string;
-	message_uuid: string;
-	file_name: string;
-	file_size: number;
-	file_type: string;
-	extracted_content: string;
-	created_at: string;
-}
-
-type MessageContentBlock = {
-	index: number;
-	type: ContentType;
-	content: string;
-};
-
-type ConversationMessageBlock = {
-	uuid: string;
-	position: [number, number];
-	content: MessageContentBlock;
-};
-
-class ConversationWriter {
-	private file: ReturnType<typeof Bun.file>;
-	private contents: Map<string, ConversationMessageBlock>;
-	private writer: FileSink;
-	constructor(path: PathLike) {
-		this.file = Bun.file(path.toString());
-		this.writer = this.file.writer();
-		this.contents = new Map<string, ConversationMessageBlock>();
-	}
-	async parse() {
-		const text = await this.file.text();
-		const mdCommentRegex = /^\[([^\]]+)\]: #$/gm;
-
-		const lines = text.split("\n");
-		let currentBlock: ConversationMessageBlock | null = null;
-		let blockStartLine = 0;
-
-		const blocks = new Map<string, ConversationMessageBlock>();
-
-		lines.forEach((line, index) => {
-			const blockMatch = line.match(/<!-- (?:(?!-->).)*-->/);
-			if (blockMatch) {
-				// Start of a new block
-				if (currentBlock) {
-					// Store previous block if exists
-					blocks.set(currentBlock.uuid, {
-						...currentBlock,
-						position: [blockStartLine, index - 1],
-					});
-				}
-				const uuid = line.match(/UUID: (\S+)/)?.[1];
-				if (uuid) {
-					currentBlock = {
-						uuid,
-						position: [index, -1],
-						content: { index: 0, type: ContentType.Text, content: "" },
-					};
-					blockStartLine = index;
-				}
-			}
-		});
-		const commentRegex = /[.*]<!-- MESSAGE UUID: (\S+) -->/;
-	}
-}
-
-class SketchManager {
-	private sketchWriters = new Map<string, FileSink>();
-	private fileContents = new Map<string, string>();
-	private blockPositions = new Map<string, Map<number, [number, number]>>();
-	private messageIndices = new Map<string, Map<string, number>>();
-	private writerMutex = new Mutex();
-	private sketchesDir: string;
-
-	constructor(sketchesDir = "./conversations") {
-		this.sketchesDir = sketchesDir;
-		try {
-			mkdirSync(sketchesDir, { recursive: true });
-		} catch (error) {
-			console.log("Sketches directory already exists");
-		}
-	}
-
-	// Add these methods to the SketchManager class
-	async writeMessageCompletion(conversationUUID: string, messageId: string) {
-		const content = `\n<!-- MESSAGE COMPLETE: ${messageId} -->\n`;
-		await this.writeContentBlock(conversationUUID, {
-			index: -1, // Special index for message completion markers
-			type: ContentType.Text,
-			content: content,
-		});
-	}
-	async writeBlockHeader(
-		conversationUUID: string,
-		blockIndex: number,
-		type: ContentType,
-		toolUseId?: string
-	) {
-		const writer = await this.getWriter(conversationUUID);
-		let header = `\n<!-- ${type.toUpperCase()} BLOCK ${blockIndex}`;
-		if (toolUseId) {
-			header += ` ID: ${toolUseId}`;
-		}
-		header += " -->\n";
-		await writer.write(header);
-		this.updateCachedContent(conversationUUID, header);
-		this.updateBlockPosition(conversationUUID, blockIndex, header);
-	}
-
-	async writeDeltaContent(
-		conversationUUID: string,
-		blockIndex: number,
-		content: string
-	) {
-		const writer = await this.getWriter(conversationUUID);
-		await writer.write(content);
-		this.updateCachedContent(conversationUUID, content);
-		this.extendBlockPosition(conversationUUID, blockIndex, content);
-	}
-
-	private extendBlockPosition(
-		conversationUUID: string,
-		blockIndex: number,
-		content: string
-	) {
-		const currentBlocks =
-			this.blockPositions.get(conversationUUID) || new Map();
-		const blockPos = currentBlocks.get(blockIndex);
-		const addedLines = content.split("\n").length;
-
-		if (blockPos) {
-			currentBlocks.set(blockIndex, [blockPos[0], blockPos[1] + addedLines]);
-		} else {
-			const currentLineCount =
-				this.fileContents.get(conversationUUID)?.split("\n").length || 0;
-			currentBlocks.set(blockIndex, [
-				currentLineCount,
-				currentLineCount + addedLines,
-			]);
-		}
-
-		this.blockPositions.set(conversationUUID, currentBlocks);
-	}
-
-	async getWriter(conversationUUID: string): Promise<FileSink> {
-		const release = await this.writerMutex.acquire();
-		try {
-			if (!this.sketchWriters.has(conversationUUID)) {
-				await this.initializeWriter(conversationUUID);
-			}
-			return this.sketchWriters.get(conversationUUID)!;
-		} finally {
-			release();
-		}
-	}
-
-	private async initializeWriter(conversationUUID: string) {
-		const filePath = `${this.sketchesDir}/${conversationUUID}.md`;
-		let existingContent = "";
-
-		try {
-			existingContent = await Bun.file(filePath).text();
-			this.parseExistingContent(conversationUUID, existingContent);
-		} catch (error) {
-			console.log("Creating new sketch file for", conversationUUID);
-		}
-
-		const writer = Bun.file(filePath).writer();
-		writer.write(existingContent);
-		this.sketchWriters.set(conversationUUID, writer);
-		this.fileContents.set(conversationUUID, existingContent);
-	}
-
-	private parseExistingContent(conversationUUID: string, content: string) {
-		const messageMap = new Map<string, number>();
-		const blockMap = new Map<number, [number, number]>();
-
-		const lines = content.split("\n");
-		let currentMessageId: string | null = null;
-		let blockStart = -1;
-
-		lines.forEach((line, index) => {
-			const messageMatch = line.match(/<!-- MESSAGE UUID: (\S+) -->/);
-			if (messageMatch) {
-				currentMessageId = messageMatch[1];
-				messageMap.set(currentMessageId, index);
-			}
-
-			const blockMatch = line.match(/<!-- (\w+) BLOCK (\d+)/);
-			if (blockMatch) {
-				blockStart = index;
-			}
-
-			if (line.includes("-->") && blockStart !== -1) {
-				const blockIndex = Number.parseInt(blockMatch![2], 10);
-				blockMap.set(blockIndex, [blockStart, index]);
-				blockStart = -1;
-			}
-		});
-
-		this.messageIndices.set(conversationUUID, messageMap);
-		this.blockPositions.set(conversationUUID, blockMap);
-	}
-
-	async writeMessageStart(conversationUUID: string, messageUUID: string) {
-		const writer = await this.getWriter(conversationUUID);
-		const header = `\n<!-- MESSAGE UUID: ${messageUUID} -->\n`;
-		await writer.write(header);
-		this.updateCachedContent(conversationUUID, header);
-	}
-
-	async writeContentBlock(
-		conversationUUID: string,
-		block: {
-			index: number;
-			type: ContentType;
-			toolUseId?: string;
-			content: string;
-		}
-	) {
-		const writer = await this.getWriter(conversationUUID);
-		let blockHeader = `\n<!-- ${block.type.toUpperCase()} BLOCK ${block.index}`;
-
-		if (block.toolUseId) {
-			blockHeader += ` ID: ${block.toolUseId}`;
-		}
-
-		blockHeader += " -->\n";
-		const fullContent = `${blockHeader + block.content}\n`;
-
-		await writer.write(fullContent);
-		this.updateCachedContent(conversationUUID, fullContent);
-		this.updateBlockPosition(conversationUUID, block.index, fullContent);
-	}
-
-	private updateCachedContent(conversationUUID: string, content: string) {
-		const currentContent = this.fileContents.get(conversationUUID) || "";
-		this.fileContents.set(conversationUUID, currentContent + content);
-	}
-
-	private updateBlockPosition(
-		conversationUUID: string,
-		blockIndex: number,
-		content: string
-	) {
-		const lines = content.split("\n").length;
-		const currentBlocks =
-			this.blockPositions.get(conversationUUID) || new Map();
-		const startLine =
-			this.fileContents.get(conversationUUID)?.split("\n").length || 0;
-		currentBlocks.set(blockIndex, [startLine, startLine + lines]);
-		this.blockPositions.set(conversationUUID, currentBlocks);
-	}
-
-	async updateContentBlock(
-		conversationUUID: string,
-		blockIndex: number,
-		newContent: string
-	) {
-		const release = await this.writerMutex.acquire();
-		try {
-			const writer = await this.getWriter(conversationUUID);
-			const currentContent = this.fileContents.get(conversationUUID) || "";
-			const blockPos = this.blockPositions
-				.get(conversationUUID)
-				?.get(blockIndex);
-
-			if (!blockPos) {
-				throw new Error(
-					`Block ${blockIndex} not found for ${conversationUUID}`
-				);
-			}
-
-			const lines = currentContent.split("\n");
-			const newLines = [
-				...lines.slice(0, blockPos[0]),
-				`<!-- REPLACING BLOCK ${blockIndex} -->`,
-				newContent,
-				...lines.slice(blockPos[1]),
-			];
-
-			const newContentStr = newLines.join("\n");
-			await writer.write(newContentStr);
-			this.fileContents.set(conversationUUID, newContentStr);
-			this.parseExistingContent(conversationUUID, newContentStr);
-		} finally {
-			release();
-		}
-	}
-
-	async closeWriter(conversationUUID: string) {
-		const release = await this.writerMutex.acquire();
-		try {
-			const writer = this.sketchWriters.get(conversationUUID);
-			if (writer) {
-				await writer.end();
-				this.sketchWriters.delete(conversationUUID);
-				this.fileContents.delete(conversationUUID);
-				this.blockPositions.delete(conversationUUID);
-				this.messageIndices.delete(conversationUUID);
-			}
-		} finally {
-			release();
-		}
-	}
-}
-
-interface ContentBlockTracker {
-	index: number;
-	type: ContentType;
-	textContent: string;
-
-	currentBlocks: Map<
-		number,
-		{
-			index: number;
-			type: ContentType;
-			textContent: string;
-			toolUseId?: string;
-			toolResult?: string;
-			fragments: string[];
-			status: "pending" | "valid" | "invalid";
-			replacedBy?: number;
-			is_error?: boolean;
-		}
-	>;
-	toolRelationships: Map<
-		string,
-		{
-			toolUseIndex: number;
-			toolResultIndex?: number;
-			status: "pending" | "success" | "error";
-		}
-	>;
-}
+import {
+  ContentType,
+  type ChatConversation,
+  type ChatMessage,
+  type ClaudeEvent,
+  type MessageDeltaEvent,
+  type NewChatRequest
+} from '../types/claude';
+import type { Payload } from '../types/common';
+import * as schema from './schema';
 
 interface ClientConnection {
-	ws: ServerWebSocket<WebSocketData>;
-	activeConversation: string | null;
-	clientId: string;
+  ws: ServerWebSocket<WebSocketData>;
+  activeConversation: string | null;
+  clientId: string;
 }
 
 const clients = new Map<string, ClientConnection>();
 
 interface ContentBlock {
-	index: number;
-	content: string;
-	type?: string;
-	jsonParts?: string[];
+  index: number;
+  content: string;
+  type?: string;
+  jsonParts?: string[];
+}
+
+function escapeJsonString(str: string): string {
+  return str
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
 }
 
 interface WebSocketData {
-	currentMessage: {
-		id: string;
-		conversation_uuid: string;
-		contentBlocks: ContentBlock[];
-		model: string;
-		artifacts: string[];
-		created_at: string;
-		currentBlockIndex: number;
-		activeCodeBlock: boolean;
-		blockTracker: ContentBlockTracker;
-	} | null;
-	activeConversation: string | null;
-	clientId: string;
-}
+  currentMessage: {
+    id: string;
+    conversation_uuid: string;
+    contentBlocks: ContentBlock[];
+    model: string;
+    artifacts: string[];
+    created_at: string;
+    currentBlockIndex: number;
+    activeCodeBlock: boolean;
+    toolCalls: Map<
+      string,
+      {
+        isFirstChunk: boolean;
+        hasContent: boolean;
+      }
+    > | null;
+  } | null;
 
-// Helper function to broadcast to conversation participants
-function broadcastToConversation(conversationUUID: string, message: any) {
-	for (const client of clients.values()) {
-		if (
-			client.activeConversation === conversationUUID &&
-			client.ws.readyState === WebSocket.OPEN
-		) {
-			client.ws.send(JSON.stringify(message));
-		}
-	}
+  activeConversation: string | null;
+  clientId: string;
+  openaiRequestId?: string; // Add this line
 }
 
 // Constants and initialization
-const sketchManager = new SketchManager();
-const sketchesDir = "./conversations";
-const sqlite = new Database("claude.db", {
-	create: true,
+const sqlite = new Database('claude.db', {
+  create: true
 });
-sqlite.exec("PRAGMA foreign_keys = ON"); // Enable foreign key constraints
-
 const db = drizzle(sqlite, { schema });
 // Run migrations on startup
-migrate(db, { migrationsFolder: "./drizzle" });
-
-const messageMutex = new Mutex();
-
-// Enhanced conversation handler
-// Updated conversation handler with proper date handling
-async function handleConversationData(
-	conversation_uuid: string,
-	data: any
-) {
-	// Handle undefined, null or empty data
-	if (!data) {
-		console.log(`No conversation data to process for ${conversation_uuid}`);
-		return;
-	}
-
-	// Since we're getting data from external sources, handle it generically
-	const convs = Array.isArray(data) ? data : [{ ...data, conversation_uuid }];
-
-	if (convs.length === 0) {
-		console.log(`No conversation data to process for ${conversation_uuid}`);
-		return;
-	}
-
-	const now = new Date().toISOString();
-
-	for (const conv of convs) {
-		// Validate critical fields
-		if (!conv.uuid && !conversation_uuid) {
-			console.error("Cannot process conversation without UUID");
-			continue;
-		}
-
-		const convUuid = conv.uuid || conversation_uuid;
-
-		try {
-			// Sanitize the data to avoid foreign key issues
-			const projectUuid = conv.project_uuid;
-
-			// If project_uuid is provided, verify it exists
-			if (projectUuid) {
-				const projectExists = await db
-					.select({ count: sql`count(*)` })
-					.from(schema.projects)
-					.where(eq(schema.projects.uuid, projectUuid));
-
-				if (projectExists[0]?.count === 0) {
-					// Project doesn't exist, remove the reference to avoid foreign key error
-					console.warn(`Project ${projectUuid} not found for conversation ${convUuid}, removing reference`);
-					conv.project_uuid = null;
-				}
-			}
-
-			await db
-				.insert(schema.conversations)
-				.values({
-					uuid: convUuid,
-					name: conv.name || "",
-					summary: conv.summary || "",
-					model: conv.model || null,
-					created_at:
-						conv.created_at instanceof Date
-							? conv.created_at.toISOString()
-							: conv.created_at || now,
-					updated_at:
-						conv.updated_at instanceof Date
-							? conv.updated_at.toISOString()
-							: conv.updated_at || now,
-					settings: conv.settings || {},
-					is_starred: !!conv.is_starred,
-					current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
-					project_uuid: conv.project_uuid || null,
-				})
-				.onConflictDoUpdate({
-					target: schema.conversations.uuid,
-					set: {
-						name: conv.name || "",
-						summary: conv.summary || "",
-						model: conv.model || null,
-						updated_at:
-							conv.updated_at instanceof Date
-								? conv.updated_at.toISOString()
-								: conv.updated_at || now,
-						settings: conv.settings || {},
-						is_starred: !!conv.is_starred,
-						current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
-						project_uuid: conv.project_uuid || null,
-					},
-				});
-		} catch (error) {
-			console.error(`Error inserting/updating conversation ${convUuid}:`, error);
-
-			// Try again without the project reference if it's a foreign key error
-			if ((error as Error).toString().includes('FOREIGN KEY constraint failed') && conv.project_uuid) {
-				try {
-					console.log(`Retrying conversation ${convUuid} without project reference`);
-
-					await db
-						.insert(schema.conversations)
-						.values({
-							uuid: convUuid,
-							name: conv.name || "",
-							summary: conv.summary || "",
-							model: conv.model || null,
-							created_at:
-								conv.created_at instanceof Date
-									? conv.created_at.toISOString()
-									: conv.created_at || now,
-							updated_at:
-								conv.updated_at instanceof Date
-									? conv.updated_at.toISOString()
-									: conv.updated_at || now,
-							settings: conv.settings || {},
-							is_starred: !!conv.is_starred,
-							current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
-							project_uuid: null, // Set project_uuid to null to avoid foreign key error
-						})
-						.onConflictDoUpdate({
-							target: schema.conversations.uuid,
-							set: {
-								name: conv.name || "",
-								summary: conv.summary || "",
-								model: conv.model || null,
-								updated_at:
-									conv.updated_at instanceof Date
-										? conv.updated_at.toISOString()
-										: conv.updated_at || now,
-								settings: conv.settings || {},
-								is_starred: !!conv.is_starred,
-								current_leaf_message_uuid: conv.current_leaf_message_uuid || null,
-								project_uuid: null, // Set project_uuid to null to avoid foreign key error
-							},
-						});
-
-					console.log(`Successfully inserted/updated conversation ${convUuid} without project reference`);
-				} catch (retryError) {
-					console.error(`Failed retry for conversation ${convUuid}:`, retryError);
-				}
-			}
-		}
-
-		// Process messages if they exist
-		if (conv.chat_messages && Array.isArray(conv.chat_messages)) {
-			for (const msg of conv.chat_messages) {
-				if (!msg.uuid) {
-					console.warn("Skipping message without UUID");
-					continue;
-				}
-
-				try {
-					// First check if this message already exists
-					const existingMsg = await db
-						.select({ count: sql`count(*)` })
-						.from(schema.messages)
-						.where(eq(schema.messages.uuid, msg.uuid));
-
-					const exists = existingMsg[0]?.count > 0;
-
-					if (exists) {
-						// Update existing message
-						await db
-							.update(schema.messages)
-							.set({
-								text: msg.text || "",
-								sender: msg.sender || "unknown",
-								updated_at:
-									msg.updated_at instanceof Date
-										? msg.updated_at.toISOString()
-										: msg.updated_at || now,
-								truncated: msg.truncated || false,
-								stop_reason: msg.stop_reason || null,
-								parent_message_uuid: msg.parent_message_uuid || "",
-								model: conv.model || null,
-							})
-							.where(eq(schema.messages.uuid, msg.uuid));
-					} else {
-						// Find max index to avoid conflicts
-						const highestIndex = await db
-							.select({
-								maxIndex: sql`max(${schema.messages.index})`.as('maxIndex')
-							})
-							.from(schema.messages)
-							.where(eq(schema.messages.conversation_uuid, convUuid));
-
-						const nextIndex = (highestIndex[0]?.maxIndex || 0) + 1;
-
-						// Create new message
-						await db
-							.insert(schema.messages)
-							.values({
-								uuid: msg.uuid,
-								conversation_uuid: convUuid,
-								text: msg.text || "",
-								sender: msg.sender || "unknown",
-								index: nextIndex, // Use calculated index to avoid conflicts
-								created_at:
-									msg.created_at instanceof Date
-										? msg.created_at.toISOString()
-										: msg.created_at || now,
-								updated_at:
-									msg.updated_at instanceof Date
-										? msg.updated_at.toISOString()
-										: msg.updated_at || now,
-								truncated: msg.truncated || false,
-								stop_reason: msg.stop_reason || null,
-								parent_message_uuid: msg.parent_message_uuid || "",
-								model: conv.model || null,
-							});
-					}
-				} catch (messageError) {
-					console.error(`Error processing message ${msg.uuid}:`, messageError);
-				}
-			}
-		}
-	}
-}
-
-
-
+migrate(db, { migrationsFolder: './drizzle' });
 
 const loggerColors = {
-	info: Bun.color("blue", "ansi"),
-	error: Bun.color("red", "ansi"),
-	warn: Bun.color("yellow", "ansi"),
-	reset: "\x1b[0m",
+  info: Bun.color('blue', 'ansi'),
+  error: Bun.color('red', 'ansi'),
+  warn: Bun.color('yellow', 'ansi'),
+  reset: '\x1b[0m'
 };
-const color_reset = "\x1b[0m";
+const color_reset = '\x1b[0m';
+
 function log(level: keyof typeof loggerColors, message: string) {
-	const color = loggerColors[level];
-	console.log(
-		`[${color}${level.toUpperCase()}${color_reset}] ${message}${color_reset}`
-	);
+  const color = loggerColors[level];
+  console.log(
+    `[${color}${level.toUpperCase()}${color_reset}] ${message}${color_reset}`
+  );
 }
 
+class CloodCursor {
+  public current_conversation_uuid: string | null;
+  public ws_client: ServerWebSocket<WebSocketData> | null;
+  public current_message_uuid: string | null;
+  public current_message_buffer: string;
+
+  public chat_messages: Map<string, ChatMessage>;
+  public conversations: Map<string, ChatConversation>;
+
+  constructor(conversation_uuid: string | null, chat_messages: ChatMessage[]) {
+    this.chat_messages = new Map(
+      chat_messages.reduce((acc, message) => {
+        acc.set(message.uuid, message);
+        return acc;
+      }, new Map())
+    );
+    this.conversations = new Map();
+    this.current_conversation_uuid = conversation_uuid;
+
+    this.current_message_uuid = null;
+    this.current_message_buffer = '';
+    this.ws_client = null;
+  }
+
+  public newMessage(message: ChatMessage) {
+    this.chat_messages.set(message.uuid, message);
+  }
+
+  public appendToCurrentMessage(text: string) {
+    this.current_message_buffer += text;
+  }
+}
+
+const cursor = new CloodCursor(null, []);
+
 // WebSocket server setup
-Bun.serve<WebSocketData>({
-	port: 3000,
-	fetch(req, server) {
-		if (server.upgrade(req)) return;
-		return new Response("Not found", { status: 404 });
-	},
-	websocket: {
-		async open(ws) {
-			const clientId = crypto.randomUUID();
-			ws.data = {
-				currentMessage: null,
-				activeConversation: null,
-				clientId,
-			};
-
-			// Add to clients map
-			clients.set(clientId, {
-				ws,
-				activeConversation: null,
-				clientId,
-			});
-		},
-		async close(ws) {
-			// Remove from clients map
-			clients.delete(ws.data.clientId);
-		},
-
-		async message(ws, raw) {
-			const release = await messageMutex.acquire();
-			let payload: Payload;
-
-			try {
-				payload = JSON.parse(raw.toString()) as Payload;
-			} catch (error) {
-				log("error", `Error parsing message: ${error instanceof Error ? error.message : String(error)}`);
-				release();
-				return;
-			}
-
-			log("info", ` - [WS] - ${payload.type}`);
-			const { conversation_uuid, type } = payload;
-			const { content } = payload;
-			const now = new Date().toISOString();
-			try {
-				switch (content.type) {
-
-					// Basic website interaction events
-					case "conversation_title": {
-						// Validate the title and conversation exists
-						try {
-							if (!conversation_uuid) {
-								console.error("No conversation UUID provided for title update");
-								break;
-							}
-
-							// Make sure we have a title value
-							const titleValue = content.title !== undefined ? content.title : "";
-
-							// First check if the conversation exists
-							const existingConv = await db
-								.select({ count: sql`count(*)` })
-								.from(schema.conversations)
-								.where(eq(schema.conversations.uuid, conversation_uuid));
-
-							if (existingConv[0]?.count === 0) {
-								// Conversation doesn't exist, create it
-								await db
-									.insert(schema.conversations)
-									.values({
-										uuid: conversation_uuid,
-										name: titleValue,
-										created_at: now,
-										updated_at: now
-									});
-
-								console.log(`Created new conversation with title "${titleValue}"`);
-							} else {
-								// Update existing conversation
-								await db
-									.update(schema.conversations)
-									.set({ name: titleValue })
-									.where(eq(schema.conversations.uuid, conversation_uuid));
-							}
-
-							// Broadcast title change to all conversation participants
-							broadcastToConversation(conversation_uuid, {
-								type: "conversation_title_updated",
-								title: titleValue,
-							});
-						} catch (error) {
-							console.error(`Failed to update conversation title:`, error);
-						}
-						break;
-					}
-
-
-
-					case "conversations_list":
-						// Better handling of undefined/null data
-						if (!content.data) {
-							console.log("[DEBUG] Handling conversations_list with no data");
-							break;
-						}
-
-						console.log(
-							"[DEBUG] Handling conversations_list with",
-							Array.isArray(content.data) ? content.data.length : "non-array",
-							"items"
-						);
-
-						try {
-							await handleConversationData(conversation_uuid || "default", content.data);
-						} catch (error) {
-							console.error("Error handling conversations list:", error);
-						}
-						break;
-
-
-					case "conversation_detail": {
-						console.log(
-							"[DEBUG] Handling conversation_detail:",
-							content.data.uuid
-						);
-						await handleConversationData(conversation_uuid, [content.data]);
-						ws.data.activeConversation = content.data.uuid;
-
-						// Update client tracking
-						const client = clients.get(ws.data.clientId);
-						if (client) {
-							client.activeConversation = content.data.uuid;
-							clients.set(ws.data.clientId, client);
-						}
-						break;
-					}
-
-					// Claude SSE event handling
-					case "message_start": {
-						// Validate conversation UUID
-						try {
-							if (!conversation_uuid) {
-								console.error("No conversation UUID provided for message creation");
-								break;
-							}
-
-							// Check if conversation exists, create if needed
-							const existingConv = await db
-								.select({ count: sql`count(*)` })
-								.from(schema.conversations)
-								.where(eq(schema.conversations.uuid, conversation_uuid));
-
-							if (existingConv[0]?.count === 0) {
-								// Create a minimal conversation record
-								await db
-									.insert(schema.conversations)
-									.values({
-										uuid: conversation_uuid,
-										name: "New conversation",
-										created_at: now,
-										updated_at: now
-									});
-
-								console.log(`Created new conversation ${conversation_uuid} for message`);
-							}
-
-							// Initialize new message tracking
-							const messageUUID = content.message.uuid;
-							await sketchManager.writeMessageStart(
-								conversation_uuid,
-								messageUUID
-							);
-
-							ws.data.currentMessage = {
-								id: messageUUID,
-								conversation_uuid: conversation_uuid,
-								contentBlocks: [],
-								model: content.message.model || "",
-								artifacts: [],
-								created_at: now,
-								currentBlockIndex: 0,
-								activeCodeBlock: false,
-								blockTracker: {
-									index: 0,
-									type: ContentType.Text,
-									textContent: "",
-									currentBlocks: new Map(),
-									toolRelationships: new Map(),
-								},
-							};
-
-							// Find the next available index for this message
-							const highestIndex = await db
-								.select({
-									maxIndex: sql`max(${schema.messages.index})`.as('maxIndex')
-								})
-								.from(schema.messages)
-								.where(eq(schema.messages.conversation_uuid, conversation_uuid));
-
-							const nextIndex = (highestIndex[0]?.maxIndex || 0) + 1;
-
-							// Create initial message record
-							await db.insert(schema.messages).values({
-								uuid: messageUUID,
-								conversation_uuid: conversation_uuid,
-								model: content.message.model || null,
-								sender: "assistant",
-								text: "",
-								index: nextIndex,
-								created_at: now,
-								updated_at: now,
-								parent_message_uuid: content.message.parent_uuid || "",
-								truncated: false,
-							});
-
-							console.log(`Created new message ${messageUUID} with index ${nextIndex}`);
-						} catch (error) {
-							console.error(`Failed to create message:`, error);
-							ws.data.currentMessage = null;
-						}
-						break;
-					}
-
-
-
-					case "message_delta": {
-						if (!ws.data.currentMessage) break;
-
-						// Handle update to message metadata like stop_reason
-						if (content.delta?.stop_reason) {
-							await db
-								.update(schema.messages)
-								.set({
-									stop_reason: content.delta.stop_reason,
-									updated_at: now,
-								})
-								.where(eq(schema.messages.uuid, ws.data.currentMessage.id));
-						}
-
-						// Check for successful tool calls and finalize their artifacts
-						for (const [toolUseId, rel] of ws.data.currentMessage.blockTracker.toolRelationships.entries()) {
-							if (rel.status === "success") {
-								await db
-									.update(schema.artifacts)
-									.set({
-										status: "final",
-										updated_at: now,
-									})
-									.where(eq(schema.artifacts.tool_use_id, toolUseId));
-							}
-						}
-						break;
-					}
-
-					case "content_block_start": {
-						if (!ws.data.currentMessage?.blockTracker) break;
-
-						const tracker = ws.data.currentMessage.blockTracker;
-						const blockIndex = content.index;
-
-						// Delete existing block content if any
-						await db
-							.delete(schema.messageContents)
-							.where(
-								and(
-									eq(
-										schema.messageContents.messageUuid,
-										ws.data.currentMessage.id
-									),
-									eq(schema.messageContents.blockIndex, blockIndex)
-								)
-							);
-
-						// Handle block replacements
-						if (tracker.currentBlocks.has(blockIndex)) {
-							await sketchManager.updateContentBlock(
-								conversation_uuid,
-								blockIndex,
-								`<!-- REPLACED BLOCK ${blockIndex} -->`
-							);
-						}
-
-						// Determine block type and tool ID
-						const blockType = content.content_block.type as ContentType;
-						const contentBlock = content.content_block;
-
-						const toolUseId =
-							blockType === ContentType.ToolUse
-								? contentBlock.id || `tool_${crypto.randomUUID()}`
-								: blockType === ContentType.ToolResult
-									? contentBlock.tool_use_id || undefined
-									: undefined;
-
-						// Initialize new block
-						const newBlock = {
-							index: blockIndex,
-							type: blockType,
-							textContent: "",
-							toolUseId: toolUseId,
-							toolResult: undefined,
-							fragments: [],
-							status: "pending" as const,
-							replacedBy: undefined,
-							is_error: 'is_error' in contentBlock ? !!contentBlock.is_error : false,
-						};
-
-						tracker.currentBlocks.set(blockIndex, newBlock);
-
-						// Track tool relationships
-						if (blockType === ContentType.ToolUse && newBlock.toolUseId) {
-							tracker.toolRelationships.set(newBlock.toolUseId, {
-								toolUseIndex: blockIndex,
-								status: "pending",
-							});
-						} else if (blockType === ContentType.ToolResult && newBlock.toolUseId) {
-							const relationship = tracker.toolRelationships.get(newBlock.toolUseId);
-							if (relationship) {
-								relationship.toolResultIndex = blockIndex;
-								relationship.status = newBlock.is_error ? "error" : "success";
-							}
-						}
-
-						await sketchManager.writeBlockHeader(
-							conversation_uuid,
-							blockIndex,
-							newBlock.type,
-							newBlock.toolUseId
-						);
-
-						break;
-					}
-
-					case "content_block_delta": {
-						if (!ws.data.currentMessage) break;
-						const block = ws.data.currentMessage.blockTracker.currentBlocks.get(
-							content.index
-						);
-						if (!block) break;
-
-						const fragmentSequence = block.fragments.length;
-						const baseValues = {
-							id: crypto.randomUUID(),
-							messageUuid: ws.data.currentMessage.id,
-							blockIndex: content.index,
-							fragmentSequence,
-							createdAt: now,
-							updatedAt: now,
-						};
-
-						// Handle text delta
-						if (content.delta?.type === "text_delta" && content.delta.text) {
-							await db.insert(schema.messageContents).values({
-								...baseValues,
-								contentType: ContentType.Text,
-								textContent: content.delta.text,
-							});
-							block.fragments.push(content.delta.text);
-							block.textContent += content.delta.text;
-							await sketchManager.writeDeltaContent(
-								conversation_uuid,
-								content.index,
-								content.delta.text
-							);
-						}
-
-						// Handle JSON delta for tool uses
-						if (content.delta?.type === "input_json_delta" && content.delta.partial_json) {
-							await db.insert(schema.messageContents).values({
-								...baseValues,
-								contentType: ContentType.ToolUse,
-								toolInput: content.delta.partial_json,
-							});
-							block.fragments.push(content.delta.partial_json);
-							if (block.type === ContentType.ToolUse) {
-								const relationship =
-									ws.data.currentMessage.blockTracker.toolRelationships.get(
-										block.toolUseId!
-									);
-								if (relationship) {
-									relationship.status = "pending";
-								}
-							}
-							await sketchManager.writeDeltaContent(
-								conversation_uuid,
-								content.index,
-								content.delta.partial_json
-							);
-						}
-						break;
-					}
-
-					case "content_block_stop": {
-						if (!ws.data.currentMessage) break;
-
-						const blockIndex = content.index;
-						const block =
-							ws.data.currentMessage.blockTracker.currentBlocks.get(blockIndex);
-						if (!block) break;
-
-						// Finalize text block
-						if (block.type === ContentType.Text) {
-							await db
-								.update(schema.messageContents)
-								.set({ isComplete: true })
-								.where(
-									and(
-										eq(schema.messageContents.messageUuid, ws.data.currentMessage.id),
-										eq(schema.messageContents.blockIndex, blockIndex)
-									)
-								);
-						}
-
-						// Handle tool use completion
-						if (block.type === ContentType.ToolUse) {
-							try {
-								const combinedJson = block.fragments.join("");
-								const parsed = JSON.parse(combinedJson);
-
-								await db.transaction(async (tx) => {
-									await tx
-										.update(schema.messageContents)
-										.set({
-											toolInput: parsed,
-											isComplete: true,
-											toolResult: null,
-										})
-										.where(
-											and(
-												eq(schema.messageContents.messageUuid, ws.data.currentMessage!.id),
-												eq(schema.messageContents.blockIndex, blockIndex)
-											)
-										);
-
-									await tx.insert(schema.artifacts).values({
-										id: parsed.id,
-										version_uuid: parsed.version_uuid || crypto.randomUUID(),
-										content: parsed.content,
-										conversation_uuid:
-											ws.data.currentMessage!.conversation_uuid,
-										type: parsed.type,
-										title: parsed.title,
-										language: parsed.language,
-										message_uuid: ws.data.currentMessage?.id,
-										tool_use_id: block.toolUseId,
-										status: "draft",
-										created_at: now,
-										updated_at: now,
-									});
-								});
-
-								await sketchManager.writeDeltaContent(
-									conversation_uuid,
-									blockIndex,
-									`\n\`\`\`${parsed.language || 'json'}\n${parsed.content}\n\`\`\`\n`
-								);
-							} catch (error) {
-								log("error", `Error processing tool use block: ${error instanceof Error ? error.message : String(error)}`);
-								await sketchManager.writeDeltaContent(
-									conversation_uuid,
-									blockIndex,
-									`\n<!-- INVALID TOOL USE BLOCK ${blockIndex} -->\n`
-								);
-
-								block.status = "invalid";
-								await db
-									.update(schema.messageContents)
-									.set({ isComplete: false })
-									.where(
-										and(
-											eq(schema.messageContents.messageUuid, ws.data.currentMessage!.id),
-											eq(schema.messageContents.blockIndex, blockIndex)
-										)
-									);
-							}
-						}
-
-						// Handle tool results
-						if (block.type === ContentType.ToolResult) {
-							const relationship =
-								ws.data.currentMessage.blockTracker.toolRelationships.get(
-									block.toolUseId!
-								);
-
-							if (relationship) {
-								relationship.status = block.is_error ? "error" : "success";
-								relationship.toolResultIndex = blockIndex;
-
-								await db.transaction(async (tx) => {
-									await tx
-										.update(schema.artifacts)
-										.set({
-											status: block.is_error ? "invalid" : "valid",
-											updated_at: now,
-										})
-										.where(eq(schema.artifacts.tool_use_id, block.toolUseId!));
-
-									await tx
-										.update(schema.messageContents)
-										.set({
-											isComplete: true,
-											toolResult: block.fragments.join(""),
-											toolUseId: block.toolUseId,
-										})
-										.where(
-											and(
-												eq(schema.messageContents.messageUuid, ws.data.currentMessage!.id),
-												eq(schema.messageContents.blockIndex, blockIndex)
-											)
-										);
-								});
-							}
-						}
-						break;
-					}
-
-					case "message_stop": {
-						if (!ws.data.currentMessage) break;
-						const conversationUUID = ws.data.currentMessage.conversation_uuid;
-						const messageId = ws.data.currentMessage.id;
-
-						// Finalize all blocks and relationships
-						await db.transaction(async (tx) => {
-							// Cleanup invalid/replaced blocks
-							for (const [index, block] of ws.data.currentMessage!.blockTracker
-								.currentBlocks) {
-								if (block.status !== "valid") {
-									await tx
-										.delete(schema.messageContents)
-										.where(
-											and(
-												eq(schema.messageContents.messageUuid, ws.data.currentMessage!.id),
-												eq(schema.messageContents.blockIndex, index)
-											)
-										);
-
-									if (block.toolUseId) {
-										await tx
-											.delete(schema.artifacts)
-											.where(eq(schema.artifacts.tool_use_id, block.toolUseId));
-									}
-								}
-							}
-
-							// Assemble final message text from valid blocks
-							const textBlocks = await tx
-								.select({
-									textContent: schema.messageContents.textContent,
-								})
-								.from(schema.messageContents)
-								.where(
-									and(
-										eq(schema.messageContents.messageUuid, messageId),
-										eq(schema.messageContents.contentType, "text" as ContentType),
-										eq(schema.messageContents.isComplete, true)
-									)
-								)
-								.orderBy(schema.messageContents.blockIndex);
-
-							const fullText = textBlocks.map((b) => b.textContent).join("\n");
-
-							// Update message record
-							await tx
-								.update(schema.messages)
-								.set({
-									text: fullText,
-									updated_at: now,
-									stop_reason: 'stop_reason' in content ? content.stop_reason : StopReason.StopSequence,
-								})
-								.where(eq(schema.messages.uuid, ws.data.currentMessage!.id));
-
-							// Update conversation record with this as current leaf
-							await tx
-								.update(schema.conversations)
-								.set({
-									current_leaf_message_uuid: ws.data.currentMessage!.id,
-									updated_at: now,
-								})
-								.where(eq(schema.conversations.uuid, conversationUUID));
-						});
-
-						// Finalize sketch file
-						await sketchManager.writeMessageCompletion(
-							conversationUUID,
-							messageId
-						);
-
-						broadcastToConversation(conversationUUID, {
-							type: "message_completed",
-							messageId: messageId,
-						});
-
-						ws.data.currentMessage = null;
-						break;
-					}
-
-					case "message_limit": {
-						if (!ws.data.currentMessage) break;
-
-						// Handle message limit reached
-						const conversationUUID = ws.data.currentMessage.conversation_uuid;
-						const messageId = ws.data.currentMessage.id;
-
-						// Add a note about the limit in the sketch
-						await sketchManager.writeContentBlock(conversationUUID, {
-							index: -2, // Special index for limit notes
-							type: ContentType.Text,
-							content: `\n<!-- MESSAGE LIMIT REACHED: ${content.message_limit?.type || 'unknown'} -->\n`,
-						});
-
-						// Update database record with appropriate stop reason
-						await db
-							.update(schema.messages)
-							.set({
-								updated_at: now,
-								stop_reason: StopReason.MaxTokens,
-							})
-							.where(eq(schema.messages.uuid, messageId));
-
-						// Broadcast limit notification
-						broadcastToConversation(conversationUUID, {
-							type: "message_limit_reached",
-							messageId: messageId,
-							limitType: content.message_limit?.type || 'unknown',
-						});
-
-						break;
-					}
-
-					case "ping": {
-						// Just a heartbeat, no action needed
-						break;
-					}
-
-					default:
-						console.warn("Unhandled event type:", type, content.type);
-				}
-			} catch (error) {
-				console.error(
-					"Message handling error:",
-					error instanceof Error ? error.message : String(error),
-					type,
-					content?.type || "unknown content type",
-					conversation_uuid
-				);
-
-				// Try to recover message state if possible
-				if (ws.data.currentMessage) {
-					try {
-						// Mark any pending artifacts as invalid
-						for (const [toolUseId, rel] of ws.data.currentMessage.blockTracker.toolRelationships.entries()) {
-							if (rel.status === "pending") {
-								await db
-									.update(schema.artifacts)
-									.set({
-										status: "invalid",
-										updated_at: now,
-									})
-									.where(eq(schema.artifacts.tool_use_id, toolUseId));
-							}
-						}
-
-						// Add error note to the sketch
-						await sketchManager.writeContentBlock(
-							ws.data.currentMessage.conversation_uuid,
-							{
-								index: -3, // Special index for error notes
-								type: ContentType.Text,
-								content: `\n<!-- ERROR PROCESSING EVENT: ${type}, ${content?.type} -->\n`,
-							}
-						);
-					} catch (recoveryError) {
-						console.error(
-							"Error during recovery:",
-							recoveryError instanceof Error ? recoveryError.message : String(recoveryError)
-						);
-					}
-				}
-
-				ws.data.currentMessage = null;
-			} finally {
-				release();
-			}
-		},
-	},
+const server = Bun.serve<WebSocketData>({
+  port: 3002,
+  //   static: './static',
+
+  fetch(req, server) {
+    // openai-like-api
+    const url = new URL(req.url);
+    if (url.pathname === '/') {
+      console.log(ui);
+      return new Response(Bun.file('./ui.html'));
+    }
+    console.log(url.pathname);
+    if (url.pathname === '/ws') {
+      if (server.upgrade(req)) return;
+    }
+
+    if (url.pathname.endsWith('/v1/chat/completions')) {
+      return handleCompletionsRequest(req);
+    }
+
+    if (req.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type'
+        }
+      });
+    }
+
+    return new Response('Not found', { status: 404 });
+  },
+  websocket: {
+    async open(ws) {
+      const clientId = crypto.randomUUID();
+      ws.data = {
+        currentMessage: null,
+        activeConversation: null,
+        clientId
+      };
+
+      // Add to clients map
+      clients.set(clientId, {
+        ws,
+        activeConversation: null,
+        clientId
+      });
+
+      clients;
+    },
+    async close(ws) {
+      // Remove from clients map
+      clients.delete(ws.data.clientId);
+    },
+
+    async message(ws, raw) {
+      handleMessage(ws, raw);
+    }
+  }
 });
 
-console.log("Server running on port 3000");
+async function handleMessage(
+  ws: ServerWebSocket<WebSocketData>,
+  raw: string | Buffer
+) {
+  let content: any;
+  try {
+    // The content is sometimes nested under .content in the JSON
+    const rawStr = raw.toString();
+    log('info', `Raw WS message: ${rawStr.substring(0, 100)}...`);
+
+    const parsed = JSON.parse(rawStr);
+    content = parsed.content || parsed;
+
+    log('info', ` - [WS] - ${content.type}`);
+  } catch (error) {
+    log(
+      'error',
+      `Error parsing message: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return;
+  }
+
+  cursor.ws_client = ws;
+  cursor.ws_client.ping();
+
+  if (content.type === 'ping') {
+    return ws.pong();
+  }
+
+  // Skip processing if not part of a completions request
+  const requestId = ws.data.openaiRequestId;
+  if (!requestId) {
+    log(
+      'info',
+      `No requestId found in ws.data, skipping event: ${content.type}`
+    );
+    return;
+  }
+
+  log('info', `Processing ${content.type} event for requestId: ${requestId}`);
+
+  switch (content.type) {
+    case 'new_conversation': {
+      log('info', `New conversation created with UUID: ${content.data.uuid}`);
+      cursor.current_conversation_uuid = content.data.uuid;
+      cursor.conversations.set(content.data.uuid, {});
+      break;
+    }
+    case 'message_start': {
+      log('info', `Message started with UUID: ${content.message.uuid}`);
+      cursor.current_message_uuid = content.message.uuid;
+      cursor.current_message_buffer = '';
+
+      // Initialize current message in websocket data
+      ws.data.currentMessage = {
+        id: content.message.uuid,
+        conversation_uuid: cursor.current_conversation_uuid || '',
+        contentBlocks: [],
+        model: content.message.model || '',
+        artifacts: [],
+        created_at: new Date().toISOString(),
+        currentBlockIndex: 0,
+        activeCodeBlock: false
+      };
+
+      // Send initial role chunk for OpenAI compatibility
+      log(
+        'info',
+        `Emitting start event for requestId: ${requestId}, messageId: ${content.message.uuid}`
+      );
+      streamBridge.emit(`start:${requestId}`, content.message.uuid);
+      break;
+    }
+    case 'content_block_start': {
+      log(
+        'info',
+        `Content block ${content.index} started, type: ${content.content_block.type}`
+      );
+
+      // Add the content block to our tracking
+      if (!ws.data.currentMessage) {
+        log('info', `No currentMessage in ws.data, creating new one`);
+        ws.data.currentMessage = {
+          id: cursor.current_message_uuid || '',
+          conversation_uuid: cursor.current_conversation_uuid || '',
+          contentBlocks: [],
+          model: '',
+          artifacts: [],
+          created_at: new Date().toISOString(),
+          currentBlockIndex: 0,
+          activeCodeBlock: false,
+          toolCalls: new Map() // Initialize the tool calls map
+        };
+      }
+
+      // Add the new block
+      ws.data.currentMessage.contentBlocks[content.index] = {
+        index: content.index,
+        content:
+          content.content_block.text || content.content_block.thinking || '',
+        type: content.content_block.type
+      };
+
+      if (content.content_block.type === 'text') {
+        if (content.content_block.text) {
+          log(
+            'info',
+            `Adding text to message buffer: ${content.content_block.text}`
+          );
+          cursor.current_message_buffer += content.content_block.text;
+
+          log('info', `Emitting message event for requestId: ${requestId}`);
+          streamBridge.emit(
+            `message:${requestId}`,
+            content.content_block.text,
+            cursor.current_message_uuid || ''
+          );
+        }
+      } else if (content.content_block.type === 'thinking') {
+        // Start a tool call for thinking type
+        const toolCallId = `thinking_${content.index}`;
+
+        // Initialize tool call tracking
+        ws.data.currentMessage.toolCalls.set(toolCallId, {
+          isFirstChunk: true,
+          hasContent: false
+        });
+
+        log(
+          'info',
+          `Emitting tool_call_start for requestId: ${requestId}, toolCallId: ${toolCallId}`
+        );
+        streamBridge.emit(
+          `tool_call_start:${requestId}`,
+          toolCallId,
+          'thinking',
+          cursor.current_message_uuid || ''
+        );
+
+        // If there's initial thinking content, send it
+        if (content.content_block.thinking) {
+          const escapedContent = escapeJsonString(
+            content.content_block.thinking
+          );
+          log(
+            'info',
+            `Emitting tool_call_delta with initial thinking: ${escapedContent}`
+          );
+
+          // Send as first chunk
+          streamBridge.emit(
+            `tool_call_delta:${requestId}`,
+            toolCallId,
+            escapedContent,
+            cursor.current_message_uuid || '',
+            true, // isFirstChunk
+            false // isLastChunk
+          );
+
+          // Update tracking
+          ws.data.currentMessage.toolCalls.set(toolCallId, {
+            isFirstChunk: false,
+            hasContent: true
+          });
+        }
+      }
+      break;
+    }
+
+    // Helper function to escape JSON strings
+
+    case 'content_block_delta': {
+      if (!ws.data.currentMessage) {
+        log(
+          'warn',
+          `Received content_block_delta but no currentMessage in ws.data`
+        );
+        break;
+      }
+
+      const blockIndex = content.index;
+      log(
+        'info',
+        `Content block delta for index ${blockIndex}, type: ${content.delta.type}`
+      );
+
+      const block = ws.data.currentMessage.contentBlocks[blockIndex];
+
+      if (!block) {
+        // Create the block if it doesn't exist yet
+        log('info', `No block found for index ${blockIndex}, creating new one`);
+        ws.data.currentMessage.contentBlocks[blockIndex] = {
+          index: blockIndex,
+          content: '',
+          type: content.delta.type.replace('_delta', '')
+        };
+      }
+
+      if (content.delta.type === 'text_delta' && content.delta.text) {
+        log(
+          'info',
+          `Adding text delta to message buffer: ${content.delta.text}`
+        );
+        cursor.current_message_buffer += content.delta.text;
+
+        log(
+          'info',
+          `Emitting message event for text delta, requestId: ${requestId}`
+        );
+        streamBridge.emit(
+          `message:${requestId}`,
+          content.delta.text,
+          cursor.current_message_uuid || ''
+        );
+
+        // Update the block content
+        if (ws.data.currentMessage.contentBlocks[blockIndex]) {
+          ws.data.currentMessage.contentBlocks[blockIndex].content +=
+            content.delta.text;
+        }
+      } else if (
+        content.delta.type === 'thinking_delta' &&
+        content.delta.thinking
+      ) {
+        // Send thinking delta as tool call delta
+        const toolCallId = `thinking_${blockIndex}`;
+        const escapedContent = escapeJsonString(content.delta.thinking);
+
+        // Get tracking info
+        const toolCallInfo = ws.data.currentMessage.toolCalls.get(
+          toolCallId
+        ) || {
+          isFirstChunk: true,
+          hasContent: false
+        };
+
+        log(
+          'info',
+          `Emitting tool_call_delta for thinking: ${escapedContent}, isFirstChunk: ${toolCallInfo.isFirstChunk}`
+        );
+
+        streamBridge.emit(
+          `tool_call_delta:${requestId}`,
+          toolCallId,
+          escapedContent,
+          cursor.current_message_uuid || '',
+          toolCallInfo.isFirstChunk, // isFirstChunk
+          false // isLastChunk
+        );
+
+        // Update tracking
+        ws.data.currentMessage.toolCalls.set(toolCallId, {
+          isFirstChunk: false,
+          hasContent: true
+        });
+
+        // Update the block content
+        if (ws.data.currentMessage.contentBlocks[blockIndex]) {
+          ws.data.currentMessage.contentBlocks[blockIndex].content +=
+            content.delta.thinking;
+        }
+      } else if (
+        content.delta.type === 'thinking_summary_delta' &&
+        content.delta.summary?.summary
+      ) {
+        // Handle summary deltas - add as normal content with a SUMMARY prefix
+        const toolCallId = `thinking_${blockIndex}`;
+        const summaryContent = `[SUMMARY: ${content.delta.summary.summary}]`;
+        const escapedContent = escapeJsonString(summaryContent);
+
+        // Get tracking info
+        const toolCallInfo = ws.data.currentMessage.toolCalls.get(
+          toolCallId
+        ) || {
+          isFirstChunk: true,
+          hasContent: false
+        };
+
+        log(
+          'info',
+          `Emitting tool_call_delta for thinking summary: ${escapedContent}, isFirstChunk: ${toolCallInfo.isFirstChunk}`
+        );
+
+        streamBridge.emit(
+          `tool_call_delta:${requestId}`,
+          toolCallId,
+          escapedContent,
+          cursor.current_message_uuid || '',
+          toolCallInfo.isFirstChunk, // isFirstChunk
+          false // isLastChunk
+        );
+
+        // Update tracking
+        ws.data.currentMessage.toolCalls.set(toolCallId, {
+          isFirstChunk: false,
+          hasContent: true
+        });
+      }
+      break;
+    }
+
+    case 'content_block_stop': {
+      if (!cursor.current_message_uuid) {
+        log(
+          'warn',
+          ` - [WS] - ${'Current Message Is Null, Cannot Process Message'}`
+        );
+        break;
+      }
+
+      if (!ws.data.currentMessage) {
+        log(
+          'warn',
+          `Received content_block_stop but no currentMessage in ws.data`
+        );
+        break;
+      }
+
+      const blockIndex = content.index;
+      log('info', `Content block ${blockIndex} stopped`);
+
+      const block = ws.data.currentMessage.contentBlocks[blockIndex];
+
+      if (!block) {
+        log(
+          'warn',
+          `No block found for index ${blockIndex} during content_block_stop`
+        );
+        break;
+      }
+
+      if (block.type === 'thinking') {
+        // End the tool call
+        const toolCallId = `thinking_${blockIndex}`;
+
+        // Get tracking info
+        const toolCallInfo = ws.data.currentMessage.toolCalls.get(toolCallId);
+
+        // Send a final empty chunk if needed to close the JSON properly
+        if (toolCallInfo && toolCallInfo.hasContent) {
+          log(
+            'info',
+            `Emitting final tool_call_delta for thinking block to close JSON string`
+          );
+
+          streamBridge.emit(
+            `tool_call_delta:${requestId}`,
+            toolCallId,
+            '', // Empty content for final chunk
+            cursor.current_message_uuid || '',
+            false, // isFirstChunk
+            true // isLastChunk
+          );
+        }
+
+        log(
+          'info',
+          `Emitting tool_call_end for thinking block, requestId: ${requestId}, toolCallId: ${toolCallId}`
+        );
+        streamBridge.emit(
+          `tool_call_end:${requestId}`,
+          toolCallId,
+          cursor.current_message_uuid
+        );
+
+        // Remove from tracking
+        ws.data.currentMessage.toolCalls.delete(toolCallId);
+      } else if (block.type === 'text') {
+        // Store text content
+        log(
+          'info',
+          `Storing text content in cursor.chat_messages: ${cursor.current_message_buffer}`
+        );
+        cursor.chat_messages.set(cursor.current_message_uuid, {
+          content: [
+            {
+              type: ContentType.Text,
+              text: cursor.current_message_buffer
+            }
+          ],
+          uuid: cursor.current_message_uuid,
+          sender: 'assistant'
+        });
+        console.log(cursor.current_message_buffer);
+      }
+      break;
+    }
+
+    case 'message_delta': {
+      log('info', `Message delta received: ${JSON.stringify(content.delta)}`);
+      break;
+    }
+    case 'message_limit': {
+      log(
+        'info',
+        `Message limit received: ${JSON.stringify(content.message_limit)}`
+      );
+      break;
+    }
+    case 'message_stop': {
+      log(
+        'info',
+        `Message stop received, finishing stream for requestId: ${requestId}`
+      );
+
+      // Emit end event for OpenAI streaming when the message is completely done
+      if (cursor.current_message_uuid) {
+        log(
+          'info',
+          `Emitting end event for requestId: ${requestId}, messageId: ${cursor.current_message_uuid}`
+        );
+        streamBridge.emit(`end:${requestId}`, cursor.current_message_uuid);
+
+        // Clear the requestId since it's done
+        log('info', `Clearing requestId from websocket data: ${requestId}`);
+        delete ws.data.openaiRequestId;
+        ws.data.currentMessage = null;
+      } else {
+        log('warn', `No current_message_uuid found during message_stop event`);
+      }
+
+      cursor.current_message_uuid = null;
+      break;
+    }
+    default: {
+      // Just log other event types
+      log('warn', ` - [WS] - Unhandled event type: ${content.type}`);
+    }
+  }
+
+  // Debug: Log current streamBridge event listeners
+  log(
+    'info',
+    `Current streamBridge listeners: ${JSON.stringify(
+      streamBridge.eventNames()
+    )}`
+  );
+  streamBridge.eventNames().forEach((event) => {
+    log(
+      'info',
+      `Listener count for ${event}: ${streamBridge.listenerCount(
+        event as string
+      )}`
+    );
+  });
+}
+import { inspect } from 'util';
+
+function debugEventEmitter(emitter: EventEmitter) {
+  const originalOn = emitter.on;
+  const originalEmit = emitter.emit;
+
+  emitter.on = function (eventName, listener) {
+    log('info', `Registering listener for event: ${eventName}`);
+    return originalOn.call(this, eventName, listener);
+  };
+
+  emitter.emit = function (eventName, ...args) {
+    log('info', `Emitting event: ${eventName} with ${args.length} arguments`);
+    return originalEmit.call(this, eventName, ...args);
+  };
+
+  return emitter;
+}
+
+// const streamBridge = new EventEmitter();
+const streamBridge = debugEventEmitter(new EventEmitter());
+
+// async generator
+async function handleCompletionsRequest(req: Request): Promise<Response> {
+  log('info', `create chat completions request`);
+  // Only handle POST requests
+  if (req.method !== 'POST') {
+    return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+      status: 405,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  try {
+    const body = await req.json();
+    const { messages, model = 'claude-3-opus-20240229' } = body;
+
+    // Validate that we have messages
+    if (!messages || !Array.isArray(messages)) {
+      log('error', ` - [WS] - Invalid request: messages must be an array`);
+      return new Response(
+        JSON.stringify({ error: 'Invalid request: messages must be an array' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // Combine messages into a prompt for Claude
+    const prompt = (messages as ChatCompletionMessageParam[])
+      .map((msg) => {
+        const prefix = msg.role === 'user' ? 'Human: ' : 'Assistant: ';
+        return `${prefix}${msg.content}`;
+      })
+      .join('\n');
+
+    // Create a unique ID for this request
+    const requestId = crypto.randomUUID();
+
+    // Create a stream for the response
+    const stream = new TransformStream();
+    const writer = stream.writable.getWriter();
+
+    // Create listeners for this specific stream
+    const messageHandler = (data: string, messageId: string) => {
+      const chunk = {
+        id: `chatcmpl-${messageId}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [
+          {
+            delta: { content: data },
+            index: 0,
+            finish_reason: null
+          }
+        ]
+      };
+
+      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
+      writer.write(new TextEncoder().encode(chunkStr));
+    };
+
+    const startHandler = (messageId: string) => {
+      const chunk = {
+        id: `chatcmpl-${messageId}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [
+          {
+            delta: { role: 'assistant' },
+            index: 0,
+            finish_reason: null
+          }
+        ]
+      };
+
+      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
+      writer.write(new TextEncoder().encode(chunkStr));
+    };
+
+    const endHandler = (messageId: string) => {
+      const chunk = {
+        id: `chatcmpl-${messageId}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [
+          {
+            delta: {},
+            index: 0,
+            finish_reason: 'stop'
+          }
+        ]
+      };
+
+      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
+      writer.write(new TextEncoder().encode(chunkStr));
+
+      // Send the [DONE] marker
+      writer.write(new TextEncoder().encode('data: [DONE]\n\n'));
+
+      // Close the writer
+      writer.close();
+
+      // Clean up listeners
+      cleanupEventListeners(requestId);
+    };
+
+    // 1. Tool call start - first chunk
+    const toolCallStartHandler = (
+      toolId: string,
+      toolType: string,
+      messageId: string
+    ) => {
+      const chunk = {
+        id: `chatcmpl-${messageId}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: toolId,
+                  type: 'function',
+                  function: {
+                    name: toolType,
+                    arguments: '{' // Start with opening brace
+                  }
+                }
+              ]
+            },
+            index: 0,
+            finish_reason: null
+          }
+        ]
+      };
+
+      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
+      writer.write(new TextEncoder().encode(chunkStr));
+    };
+
+    // 2. Tool call delta - middle chunks (send arguments as valid JSON key-value pairs)
+    const toolCallDeltaHandler = (
+      toolId: string,
+      content: string,
+      messageId: string,
+      isFirstChunk = false,
+      isLastChunk = false
+    ) => {
+      // Format as a proper JSON key-value pair
+      let jsonFragment;
+
+      if (isFirstChunk) {
+        // First chunk - include key and opening quote
+        jsonFragment = `"thinking":"${content}`;
+      } else if (isLastChunk) {
+        // Last chunk - include closing quote
+        jsonFragment = `${content}"`;
+      } else {
+        // Middle chunk - just the content
+        jsonFragment = content;
+      }
+
+      const chunk = {
+        id: `chatcmpl-${messageId}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: toolId,
+                  function: {
+                    arguments: jsonFragment
+                  }
+                }
+              ]
+            },
+            index: 0,
+            finish_reason: null
+          }
+        ]
+      };
+
+      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
+      writer.write(new TextEncoder().encode(chunkStr));
+    };
+
+    // 3. Tool call end - final chunk with closing brace
+    const toolCallEndHandler = (toolId: string, messageId: string) => {
+      const chunk = {
+        id: `chatcmpl-${messageId}`,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [
+          {
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: toolId,
+                  function: {
+                    arguments: '}' // End with closing brace
+                  }
+                }
+              ]
+            },
+            index: 0,
+            finish_reason: null
+          }
+        ]
+      };
+
+      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
+      writer.write(new TextEncoder().encode(chunkStr));
+    };
+
+    function cleanupEventListeners(requestId: string) {
+      streamBridge.removeListener(`message:${requestId}`, messageHandler);
+      streamBridge.removeListener(`start:${requestId}`, startHandler);
+      streamBridge.removeListener(`end:${requestId}`, endHandler);
+      streamBridge.removeListener(
+        `tool_call_start:${requestId}`,
+        toolCallStartHandler
+      );
+      streamBridge.removeListener(
+        `tool_call_delta:${requestId}`,
+        toolCallDeltaHandler
+      );
+      streamBridge.removeListener(
+        `tool_call_end:${requestId}`,
+        toolCallEndHandler
+      );
+    }
+
+    // Register listeners
+    streamBridge.on(`message:${requestId}`, messageHandler);
+    streamBridge.on(`start:${requestId}`, startHandler);
+    streamBridge.on(`end:${requestId}`, endHandler);
+    streamBridge.on(`tool_call_start:${requestId}`, toolCallStartHandler);
+    streamBridge.on(`tool_call_delta:${requestId}`, toolCallDeltaHandler);
+    streamBridge.on(`tool_call_end:${requestId}`, toolCallEndHandler);
+
+    // Find available websocket client
+    const client = cursor.ws_client;
+    if (!client) {
+      writer.write(
+        new TextEncoder().encode(
+          'data: {"error": "No available WebSocket clients"}\n\n'
+        )
+      );
+      writer.close();
+      return new Response(stream.readable, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type'
+        }
+      });
+    }
+
+    // Store requestId in the websocket data
+    client.data.openaiRequestId = requestId;
+
+    // Send the request to Claude via WebSocket
+    client.send(
+      JSON.stringify({
+        type: 'new_chat_request',
+        data: {
+          chat_messages: [
+            {
+              text: prompt
+            }
+          ]
+        }
+      } satisfies NewChatRequest)
+    );
+
+    // Return streaming response
+    return new Response(stream.readable, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type'
+      }
+    });
+  } catch (error) {
+    log(
+      'error',
+      `Error in completions request: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return new Response(JSON.stringify({ error: 'Internal server error' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+console.log('Server running on port 3002');
+
+// cursor.ws_client.send(
+//     JSON.stringify({
+//       type: 'new_chat_request',
+//       data: {
+//         chat_messages: [
+//           {
+//             text: 'Hello world!'
+//           }
+//         ]
+//       }
+//     } satisfies NewChatRequest)
+//   );
