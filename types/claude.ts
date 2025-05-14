@@ -588,6 +588,11 @@ export interface ErrorEvent extends BaseEvent {
   content: {
     type: 'error';
     message: string;
+    cause: {
+      status: number;
+      statusText: string;
+      data: any;
+    };
   };
 }
 // Common payload structure for both frontend and backend

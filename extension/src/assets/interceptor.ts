@@ -6,6 +6,8 @@ import type {
   // and looks something like this:
   // ChatMessage, (if you have a specific type for elements in chat_messages)
 } from '../../../types/claude'; // Adjust path as needed
+import { RiverSocketAdapter } from 'river.ts/websocket';
+import { events } from '../../../types/events';
 
 // Define a basic ChatMessage type if not imported
 interface ChatMessage {
@@ -19,6 +21,8 @@ const RECONNECT_DELAY_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 5000;
 const TAB_TIMEOUT_MS = 15000; // Consider tab inactive after 15s without heartbeat
 const PENDING_NEW_CHAT_DATA_KEY = 'claudeForwardPendingNewChatData';
+
+const river = new RiverSocketAdapter(events);
 
 // Generate a unique ID for this tab instance (will change on full page navigation)
 const tabInstanceId = getPersistentTabInstanceId();
@@ -240,7 +244,7 @@ function sendToWebSocket<T extends ClaudeEvent['type']>(payload: Payload<T>) {
       tab_id: tabInstanceId,
       is_new_tab: isNewTabPage
     };
-    ws.send(JSON.stringify(enhancedPayload));
+    ws.send(river.createMessage(payload.type, enhancedPayload));
     debugLog('WS-SEND', `Sent ${payload.type} event`);
   } else {
     messageQueue.push(payload);
@@ -267,18 +271,20 @@ function updateCurrentConversationId(id: string | null) {
   registerTab();
 
   if (id) {
-    sendToWebSocket({
-      type: 'worker_update_active_conversation',
-      content: {
+    ws?.send(
+      river.createMessage('worker_update_active_conversation', {
         type: 'worker_update_active_conversation',
-        clientId: 'claude-extension',
-        tabId: tabInstanceId,
-        conversationId: id
-      },
-      conversation_uuid: id,
-      endpoint: 'update_conversation',
-      url: window.location.href
-    });
+        content: {
+          type: 'worker_update_active_conversation',
+          clientId: 'claude-extension',
+          tabId: tabInstanceId,
+          conversationId: id
+        },
+        conversation_uuid: id,
+        endpoint: 'update_conversation',
+        url: window.location.href
+      })
+    );
   }
 }
 
@@ -394,6 +400,7 @@ async function processStream(response: Response, url: string) {
 
         if (dataContent) {
           try {
+            ws?.send;
             sendToWebSocket({
               ...jsonData,
               conversation_uuid,
@@ -416,15 +423,25 @@ async function processStream(response: Response, url: string) {
     }
   } catch (error) {
     debugLog('STREAM-ERROR', 'Error processing stream', error);
-    sendToWebSocket({
-      type: 'error',
-      content: {
+    ws?.send(
+      river.createMessage('error', {
         type: 'error',
-        message: `Stream processing error: ${(error as Error).message}`
-      },
-      conversation_uuid: streamConversationUuid,
-      url
-    });
+        content: {
+          type: 'error',
+          message: `Stream processing error: ${(error as Error).message}`,
+          cause: {
+            status: 500,
+            statusText: 'Internal Server Error',
+            data: error
+          }
+        },
+        conversation_uuid: streamConversationUuid,
+        url,
+        tab_id: tabInstanceId,
+        is_new_tab: isNewTabPage,
+        endpoint: 'stream_error'
+      })
+    );
   }
 }
 

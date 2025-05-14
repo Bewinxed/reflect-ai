@@ -1,6 +1,7 @@
 {
   "dependencies": {
-    "@types/bun": "^1.2.0"
+    "@types/bun": "^1.2.0",
+    "river.ts": "1.0.23-test.1"
   },
   "devDependencies": {
     "@types/node": "^22.15.17",
