@@ -264,7 +264,9 @@ function initializeInterceptors() {
 
 async function handleNewConversation(event: NewChatRequest) {
   // navigate to /new
-  window.location.href = '/new';
+  if (window.location.pathname !== '/new') {
+    window.location.href = '/new';
+  }
   // select the ProseMirror element
   const proseMirrorElement = document.querySelector('.ProseMirror');
   if (!proseMirrorElement) {
@@ -273,11 +275,15 @@ async function handleNewConversation(event: NewChatRequest) {
 
   // Set the content
   const text =
-    event.data.chat_messages?.map((message) => message.text).join('\n') || '';
+    event.data.chat_messages?.map((message) => message.text).join('\n\n') || '';
 
   // ProseMirror-specific approach: update content and dispatch input event
-  proseMirrorElement.innerHTML = `<p>${text}</p>`;
-  proseMirrorElement.dispatchEvent(new Event('input', { bubbles: true }));
+  for (const message of event.data.chat_messages ?? []) {
+    proseMirrorElement.insertAdjacentHTML(
+      'beforeend',
+      `<p>${message.text}</p>`
+    );
+  }
 
   // Find and click the send button instead of simulating Enter
   let sendButton = document.querySelector<HTMLButtonElement>(
@@ -306,5 +312,41 @@ function handleIncomingMessage(raw_event: MessageEvent<string>) {
   }
 }
 
+function addMuseButton() {
+  while (!document.querySelector('.flex-1.flex.gap-2')) {
+    // set a timeout to wait for the menu to appear
+    setTimeout(() => {
+      console.log('Muse button not added: menu not found');
+    }, 1000);
+  }
+  const menu = document.querySelector('.flex-1.flex.gap-2');
+  if (!menu) {
+    console.warn('Muse button not added: menu not found');
+    return;
+  }
+  const button = menu.appendChild(document.createElement('button'));
+  button.className = `
+  inline-flex
+  items-center
+  justify-center
+  relative
+  shrink-0
+  can-focus
+  select-none
+  disabled:pointer-events-none
+  disabled:opacity-50
+  disabled:shadow-none
+  disabled:drop-shadow-none border-0.5 transition-all h-8 min-w-8 rounded-lg flex items-center px-[7.5px] group !pointer-events-auto !outline-offset-1 text-text-300 border-border-300 active:scale-[0.98] hover:text-text-200/90 hover:bg-bg-100`;
+  button.innerHTML = '🦁';
+  const muse_enabled = localStorage.getItem('muse') === 'true';
+  button.addEventListener('click', () => {
+    const muse_enabled = localStorage.getItem('muse') === 'true';
+    localStorage.setItem('muse', muse_enabled ? 'false' : 'true');
+    button.innerHTML = muse_enabled ? '🦁' : '🦊';
+  });
+  console.log('Muse button added');
+}
+
 // Start interception
 initializeInterceptors();
+// addMuseButton();

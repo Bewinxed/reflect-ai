@@ -1,25 +1,23 @@
-import type { HTMLBundle, ServerWebSocket } from 'bun';
+import type { ServerWebSocket } from 'bun';
 import { Database } from 'bun:sqlite';
 import { drizzle } from 'drizzle-orm/bun-sqlite';
 import { migrate } from 'drizzle-orm/bun-sqlite/migrator';
 import { EventEmitter } from 'node:events';
+import { AnthropicToOpenAIAdapter } from './claude-openai-converter';
 import ui from './ui.html';
 
 import type {
   ChatCompletionChunk,
-  ChatCompletionMessageParam,
-  CreateChatCompletionRequestMessage
+  ChatCompletionCreateParams,
+  ChatCompletionMessageParam
 } from 'openai/resources';
 
 import {
   ContentType,
   type ChatConversation,
   type ChatMessage,
-  type ClaudeEvent,
-  type MessageDeltaEvent,
   type NewChatRequest
 } from '../types/claude';
-import type { Payload } from '../types/common';
 import * as schema from './schema';
 
 interface ClientConnection {
@@ -67,7 +65,8 @@ interface WebSocketData {
 
   activeConversation: string | null;
   clientId: string;
-  openaiRequestId?: string; // Add this line
+  openaiRequestId?: string;
+  adapter?: AnthropicToOpenAIAdapter; // Add this line
 }
 
 // Constants and initialization
@@ -177,11 +176,14 @@ const server = Bun.serve<WebSocketData>({
         clientId
       });
 
-      clients;
+      log('info', `Client added to clients map: ${clientId}`);
+      ws.ping();
+      return;
     },
     async close(ws) {
       // Remove from clients map
       clients.delete(ws.data.clientId);
+      log('warn', `Client removed from clients map: ${ws.data.clientId}`);
     },
 
     async message(ws, raw) {
@@ -233,11 +235,72 @@ async function handleMessage(
 
   log('info', `Processing ${content.type} event for requestId: ${requestId}`);
 
+  // Use the adapter to process the event if it exists
+  if (ws.data.adapter) {
+    const chunk = ws.data.adapter.processEvent(content);
+    // The adapter will emit 'chunk' events that we're already listening for
+
+    // Handle message start special case
+    if (content.type === 'message_start') {
+      cursor.current_message_uuid = content.message.uuid;
+      cursor.current_message_buffer = '';
+
+      // Initialize current message in websocket data for backward compatibility
+      ws.data.currentMessage = {
+        id: content.message.uuid,
+        conversation_uuid: cursor.current_conversation_uuid || '',
+        contentBlocks: [],
+        model: content.message.model || '',
+        artifacts: [],
+        created_at: new Date().toISOString(),
+        currentBlockIndex: 0,
+        activeCodeBlock: false,
+        toolCalls: new Map()
+      };
+    }
+
+    // Handle special cases for your existing code
+    if (content.type === 'message_stop') {
+      // Critical fix: Explicitly trigger 'complete' on the adapter
+      if (ws.data.adapter) {
+        log(
+          'info',
+          `Explicitly triggering adapter complete event for requestId: ${ws.data.openaiRequestId}`
+        );
+        ws.data.adapter.emit('complete');
+      }
+
+      cursor.current_message_uuid = null;
+      delete ws.data.openaiRequestId;
+      ws.data.currentMessage = null;
+      ws.data.adapter = undefined;
+    }
+
+    return;
+  }
+
   switch (content.type) {
     case 'new_conversation': {
       log('info', `New conversation created with UUID: ${content.data.uuid}`);
       cursor.current_conversation_uuid = content.data.uuid;
-      cursor.conversations.set(content.data.uuid, {});
+      cursor.conversations.set(content.data.uuid, {
+        uuid: content.data.uuid,
+        name: '',
+        summary: '',
+        model: '',
+        created_at: new Date(),
+        updated_at: new Date(),
+        settings: {
+          preview_feature_uses_artifacts: null,
+          preview_feature_uses_latex: null,
+          preview_feature_uses_citations: null,
+          enabled_artifacts_attachments: null,
+          enabled_turmeric: null,
+          paprika_mode: null
+        },
+        is_starred: false,
+        current_leaf_message_uuid: null
+      });
       break;
     }
     case 'message_start': {
@@ -254,7 +317,8 @@ async function handleMessage(
         artifacts: [],
         created_at: new Date().toISOString(),
         currentBlockIndex: 0,
-        activeCodeBlock: false
+        activeCodeBlock: false,
+        toolCalls: new Map()
       };
 
       // Send initial role chunk for OpenAI compatibility
@@ -315,10 +379,12 @@ async function handleMessage(
         const toolCallId = `thinking_${content.index}`;
 
         // Initialize tool call tracking
-        ws.data.currentMessage.toolCalls.set(toolCallId, {
-          isFirstChunk: true,
-          hasContent: false
-        });
+        if (ws.data.currentMessage && ws.data.currentMessage.toolCalls) {
+          ws.data.currentMessage.toolCalls.set(toolCallId, {
+            isFirstChunk: true,
+            hasContent: false
+          });
+        }
 
         log(
           'info',
@@ -352,10 +418,12 @@ async function handleMessage(
           );
 
           // Update tracking
-          ws.data.currentMessage.toolCalls.set(toolCallId, {
-            isFirstChunk: false,
-            hasContent: true
-          });
+          if (ws.data.currentMessage && ws.data.currentMessage.toolCalls) {
+            ws.data.currentMessage.toolCalls.set(toolCallId, {
+              isFirstChunk: false,
+              hasContent: true
+            });
+          }
         }
       }
       break;
@@ -421,9 +489,8 @@ async function handleMessage(
         const escapedContent = escapeJsonString(content.delta.thinking);
 
         // Get tracking info
-        const toolCallInfo = ws.data.currentMessage.toolCalls.get(
-          toolCallId
-        ) || {
+        const toolCallInfo = (ws.data.currentMessage.toolCalls &&
+          ws.data.currentMessage.toolCalls.get(toolCallId)) || {
           isFirstChunk: true,
           hasContent: false
         };
@@ -443,10 +510,12 @@ async function handleMessage(
         );
 
         // Update tracking
-        ws.data.currentMessage.toolCalls.set(toolCallId, {
-          isFirstChunk: false,
-          hasContent: true
-        });
+        if (ws.data.currentMessage.toolCalls) {
+          ws.data.currentMessage.toolCalls.set(toolCallId, {
+            isFirstChunk: false,
+            hasContent: true
+          });
+        }
 
         // Update the block content
         if (ws.data.currentMessage.contentBlocks[blockIndex]) {
@@ -463,9 +532,8 @@ async function handleMessage(
         const escapedContent = escapeJsonString(summaryContent);
 
         // Get tracking info
-        const toolCallInfo = ws.data.currentMessage.toolCalls.get(
-          toolCallId
-        ) || {
+        const toolCallInfo = (ws.data.currentMessage.toolCalls &&
+          ws.data.currentMessage.toolCalls.get(toolCallId)) || {
           isFirstChunk: true,
           hasContent: false
         };
@@ -485,10 +553,12 @@ async function handleMessage(
         );
 
         // Update tracking
-        ws.data.currentMessage.toolCalls.set(toolCallId, {
-          isFirstChunk: false,
-          hasContent: true
-        });
+        if (ws.data.currentMessage.toolCalls) {
+          ws.data.currentMessage.toolCalls.set(toolCallId, {
+            isFirstChunk: false,
+            hasContent: true
+          });
+        }
       }
       break;
     }
@@ -528,7 +598,9 @@ async function handleMessage(
         const toolCallId = `thinking_${blockIndex}`;
 
         // Get tracking info
-        const toolCallInfo = ws.data.currentMessage.toolCalls.get(toolCallId);
+        const toolCallInfo =
+          ws.data.currentMessage.toolCalls &&
+          ws.data.currentMessage.toolCalls.get(toolCallId);
 
         // Send a final empty chunk if needed to close the JSON properly
         if (toolCallInfo && toolCallInfo.hasContent) {
@@ -558,7 +630,9 @@ async function handleMessage(
         );
 
         // Remove from tracking
-        ws.data.currentMessage.toolCalls.delete(toolCallId);
+        if (ws.data.currentMessage.toolCalls) {
+          ws.data.currentMessage.toolCalls.delete(toolCallId);
+        }
       } else if (block.type === 'text') {
         // Store text content
         log(
@@ -572,8 +646,18 @@ async function handleMessage(
               text: cursor.current_message_buffer
             }
           ],
+          text: cursor.current_message_buffer,
           uuid: cursor.current_message_uuid,
-          sender: 'assistant'
+          sender: 'assistant',
+          index: 0,
+          created_at: new Date(),
+          updated_at: new Date(),
+          truncated: false,
+          attachments: [],
+          files: [],
+          files_v2: [],
+          sync_sources: [],
+          parent_message_uuid: ''
         });
         console.log(cursor.current_message_buffer);
       }
@@ -626,31 +710,33 @@ async function handleMessage(
   log(
     'info',
     `Current streamBridge listeners: ${JSON.stringify(
-      streamBridge.eventNames()
+      streamBridge.eventNames().map((event) => String(event))
     )}`
   );
   streamBridge.eventNames().forEach((event) => {
     log(
       'info',
-      `Listener count for ${event}: ${streamBridge.listenerCount(
-        event as string
+      `Listener count for ${String(event)}: ${streamBridge.listenerCount(
+        String(event)
       )}`
     );
   });
 }
-import { inspect } from 'util';
 
 function debugEventEmitter(emitter: EventEmitter) {
   const originalOn = emitter.on;
   const originalEmit = emitter.emit;
 
   emitter.on = function (eventName, listener) {
-    log('info', `Registering listener for event: ${eventName}`);
+    log('info', `Registering listener for event: ${String(eventName)}`);
     return originalOn.call(this, eventName, listener);
   };
 
   emitter.emit = function (eventName, ...args) {
-    log('info', `Emitting event: ${eventName} with ${args.length} arguments`);
+    log(
+      'info',
+      `Emitting event: ${String(eventName)} with ${args.length} arguments`
+    );
     return originalEmit.call(this, eventName, ...args);
   };
 
@@ -672,245 +758,63 @@ async function handleCompletionsRequest(req: Request): Promise<Response> {
   }
 
   try {
-    const body = await req.json();
-    const { messages, model = 'claude-3-opus-20240229' } = body;
+    const body = (await req.json()) as ChatCompletionCreateParams;
 
-    // Validate that we have messages
-    if (!messages || !Array.isArray(messages)) {
-      log('error', ` - [WS] - Invalid request: messages must be an array`);
-      return new Response(
-        JSON.stringify({ error: 'Invalid request: messages must be an array' }),
-        { status: 400, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Combine messages into a prompt for Claude
-    const prompt = (messages as ChatCompletionMessageParam[])
-      .map((msg) => {
-        const prefix = msg.role === 'user' ? 'Human: ' : 'Assistant: ';
-        return `${prefix}${msg.content}`;
-      })
-      .join('\n');
+    console.log(body);
 
     // Create a unique ID for this request
     const requestId = crypto.randomUUID();
+    log('info', `Creating request ID: ${requestId}`);
 
     // Create a stream for the response
     const stream = new TransformStream();
     const writer = stream.writable.getWriter();
 
-    // Create listeners for this specific stream
-    const messageHandler = (data: string, messageId: string) => {
-      const chunk = {
-        id: `chatcmpl-${messageId}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: [
-          {
-            delta: { content: data },
-            index: 0,
-            finish_reason: null
-          }
-        ]
-      };
+    // Initialize the adapter with your model mapping
+    const adapter = new AnthropicToOpenAIAdapter({
+      modelMapping: {
+        'claude-3-opus-20240229': 'gpt-4',
+        'claude-3-sonnet-20240229': 'gpt-4',
+        'claude-3-haiku-20240307': 'gpt-3.5-turbo'
+      },
+      debug: true // Set to false in production
+    });
+    log('info', `Adapter initialized, looking for available client`);
 
+    // Create a handler for the adapter's chunks
+    const handleChunk = (chunk: ChatCompletionChunk) => {
       const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
       writer.write(new TextEncoder().encode(chunkStr));
     };
 
-    const startHandler = (messageId: string) => {
-      const chunk = {
-        id: `chatcmpl-${messageId}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: [
-          {
-            delta: { role: 'assistant' },
-            index: 0,
-            finish_reason: null
-          }
-        ]
-      };
+    // Handle events from the adapter
+    adapter.on('chunk', handleChunk);
 
-      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
-      writer.write(new TextEncoder().encode(chunkStr));
-    };
-
-    const endHandler = (messageId: string) => {
-      const chunk = {
-        id: `chatcmpl-${messageId}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: [
-          {
-            delta: {},
-            index: 0,
-            finish_reason: 'stop'
-          }
-        ]
-      };
-
-      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
-      writer.write(new TextEncoder().encode(chunkStr));
-
+    // Handle completion event to finish the stream
+    adapter.on('complete', () => {
       // Send the [DONE] marker
       writer.write(new TextEncoder().encode('data: [DONE]\n\n'));
-
       // Close the writer
       writer.close();
+      // Clean up event listeners
+      adapter.removeAllListeners();
+    });
 
-      // Clean up listeners
-      cleanupEventListeners(requestId);
-    };
-
-    // 1. Tool call start - first chunk
-    const toolCallStartHandler = (
-      toolId: string,
-      toolType: string,
-      messageId: string
-    ) => {
-      const chunk = {
-        id: `chatcmpl-${messageId}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: [
-          {
-            delta: {
-              tool_calls: [
-                {
-                  index: 0,
-                  id: toolId,
-                  type: 'function',
-                  function: {
-                    name: toolType,
-                    arguments: '{' // Start with opening brace
-                  }
-                }
-              ]
-            },
-            index: 0,
-            finish_reason: null
-          }
-        ]
-      };
-
-      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
-      writer.write(new TextEncoder().encode(chunkStr));
-    };
-
-    // 2. Tool call delta - middle chunks (send arguments as valid JSON key-value pairs)
-    const toolCallDeltaHandler = (
-      toolId: string,
-      content: string,
-      messageId: string,
-      isFirstChunk = false,
-      isLastChunk = false
-    ) => {
-      // Format as a proper JSON key-value pair
-      let jsonFragment;
-
-      if (isFirstChunk) {
-        // First chunk - include key and opening quote
-        jsonFragment = `"thinking":"${content}`;
-      } else if (isLastChunk) {
-        // Last chunk - include closing quote
-        jsonFragment = `${content}"`;
-      } else {
-        // Middle chunk - just the content
-        jsonFragment = content;
-      }
-
-      const chunk = {
-        id: `chatcmpl-${messageId}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: [
-          {
-            delta: {
-              tool_calls: [
-                {
-                  index: 0,
-                  id: toolId,
-                  function: {
-                    arguments: jsonFragment
-                  }
-                }
-              ]
-            },
-            index: 0,
-            finish_reason: null
-          }
-        ]
-      };
-
-      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
-      writer.write(new TextEncoder().encode(chunkStr));
-    };
-
-    // 3. Tool call end - final chunk with closing brace
-    const toolCallEndHandler = (toolId: string, messageId: string) => {
-      const chunk = {
-        id: `chatcmpl-${messageId}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: model,
-        choices: [
-          {
-            delta: {
-              tool_calls: [
-                {
-                  index: 0,
-                  id: toolId,
-                  function: {
-                    arguments: '}' // End with closing brace
-                  }
-                }
-              ]
-            },
-            index: 0,
-            finish_reason: null
-          }
-        ]
-      };
-
-      const chunkStr = `data: ${JSON.stringify(chunk)}\n\n`;
-      writer.write(new TextEncoder().encode(chunkStr));
-    };
-
-    function cleanupEventListeners(requestId: string) {
-      streamBridge.removeListener(`message:${requestId}`, messageHandler);
-      streamBridge.removeListener(`start:${requestId}`, startHandler);
-      streamBridge.removeListener(`end:${requestId}`, endHandler);
-      streamBridge.removeListener(
-        `tool_call_start:${requestId}`,
-        toolCallStartHandler
+    // Handle errors
+    adapter.on('error', (error) => {
+      log('error', `Error in streaming: ${error.message}`);
+      writer.write(
+        new TextEncoder().encode(`data: {"error": "${error.message}"}\n\n`)
       );
-      streamBridge.removeListener(
-        `tool_call_delta:${requestId}`,
-        toolCallDeltaHandler
-      );
-      streamBridge.removeListener(
-        `tool_call_end:${requestId}`,
-        toolCallEndHandler
-      );
-    }
-
-    // Register listeners
-    streamBridge.on(`message:${requestId}`, messageHandler);
-    streamBridge.on(`start:${requestId}`, startHandler);
-    streamBridge.on(`end:${requestId}`, endHandler);
-    streamBridge.on(`tool_call_start:${requestId}`, toolCallStartHandler);
-    streamBridge.on(`tool_call_delta:${requestId}`, toolCallDeltaHandler);
-    streamBridge.on(`tool_call_end:${requestId}`, toolCallEndHandler);
+      writer.close();
+      adapter.removeAllListeners();
+    });
 
     // Find available websocket client
     const client = cursor.ws_client;
     if (!client) {
+      log('error', `No available WebSocket clients`);
+
       writer.write(
         new TextEncoder().encode(
           'data: {"error": "No available WebSocket clients"}\n\n'
@@ -927,10 +831,69 @@ async function handleCompletionsRequest(req: Request): Promise<Response> {
           'Access-Control-Allow-Headers': 'Content-Type'
         }
       });
+    } else {
+      log(
+        'info',
+        `Found client, client.data: ${JSON.stringify({
+          hasOpenaiRequestId: !!client.data.openaiRequestId,
+          clientId: client.data.clientId,
+          hasAdapter: !!client.data.adapter
+        })}`
+      );
     }
 
-    // Store requestId in the websocket data
+    // Store requestId and adapter in the websocket data
     client.data.openaiRequestId = requestId;
+    client.data.adapter = adapter; // Add this line to store the adapter
+
+    log('info', `Sending request to Claude via WebSocket`);
+
+    const messages = body.messages;
+
+    // messages.splice(0, 0, {
+    //   role: 'system',
+    //   content: `Please format your response as JSON according to this schema:\`\`\`json\n${JSON.stringify(
+    //     {
+    //       type: 'object',
+    //       properties: {
+    //         country: {
+    //           type: 'string'
+    //         },
+    //         capital: {
+    //           type: 'string'
+    //         },
+    //         currency: {
+    //           type: 'string'
+    //         },
+    //         language: {
+    //           type: 'string'
+    //         }
+    //       }
+    //     }
+    //   )}\n
+    //   \`\`\`
+    //     WRAP IT IN \`\`\` DO NOT SAY ANYTHING ELSE`
+    // });
+
+    if (body.response_format?.type === 'json_object') {
+      if (
+        !('schema' in body.response_format) ||
+        !('json_schema' in body.response_format)
+      ) {
+        return new Response(JSON.stringify({ error: 'Invalid schema' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      messages.splice(0, 0, {
+        role: 'system',
+        content: `Please format your response as JSON according to this schema:\`\`\`json\n${JSON.stringify(
+          body.response_format.schema ?? body.response_format.json_schema
+        )}\n
+      \`\`\`
+        WRAP IT IN \`\`\` DO NOT SAY ANYTHING ELSE`
+      });
+    }
 
     // Send the request to Claude via WebSocket
     client.send(
@@ -939,12 +902,24 @@ async function handleCompletionsRequest(req: Request): Promise<Response> {
         data: {
           chat_messages: [
             {
-              text: prompt
+              text: messages
+                .map((msg: ChatCompletionMessageParam) => {
+                  const prefix =
+                    msg.role === 'user'
+                      ? 'Human: '
+                      : body.response_format?.type === 'json_object'
+                      ? ''
+                      : 'Assistant: ';
+                  return `${prefix}${msg.content}`;
+                })
+                .join('\n\n')
             }
           ]
         }
       } satisfies NewChatRequest)
     );
+
+    log('info', `Request sent to Claude, returning streaming response`);
 
     // Return streaming response
     return new Response(stream.readable, {
@@ -972,16 +947,3 @@ async function handleCompletionsRequest(req: Request): Promise<Response> {
 }
 
 console.log('Server running on port 3002');
-
-// cursor.ws_client.send(
-//     JSON.stringify({
-//       type: 'new_chat_request',
-//       data: {
-//         chat_messages: [
-//           {
-//             text: 'Hello world!'
-//           }
-//         ]
-//       }
-//     } satisfies NewChatRequest)
-//   );
