@@ -11,6 +11,23 @@ export interface BaseEvent {
 }
 
 /**
+ * Base interface for client-server messages
+ * Extends the BaseEvent with client information
+ */
+export interface ClientMessage extends BaseEvent {
+  /** Tab ID of the sender */
+  tab_id?: string;
+  /** Whether the tab is on /new page */
+  is_new_tab?: boolean;
+  /** Current conversation UUID if available */
+  conversation_uuid?: string | null;
+  /** API endpoint that was called (if applicable) */
+  endpoint?: string;
+  /** URL of the tab */
+  url?: string;
+}
+
+/**
  * Event sent at the beginning of a streaming response
  * Contains the initial message object with empty content
  */
@@ -36,14 +53,16 @@ export interface MessageStartEvent extends BaseEvent {
     stop_reason: string | null;
     /** Sequence that caused the model to stop generating (null when streaming begins) */
     stop_sequence: string | null;
+    /** Conversation UUID this message belongs to */
+    conversation_uuid?: string;
   };
 }
 
 /**
  * Event for requesting a new chat conversation
  */
-export interface NewChatRequest extends BaseEvent {
-  type: 'new_chat_request';
+export interface NewChatRequest extends ClientMessage {
+  type: 'new_chat_request' & {};
   /** Partial chat conversation data */
   data: Partial<ChatConversation>;
 }
@@ -52,7 +71,7 @@ export interface NewChatRequest extends BaseEvent {
  * Event signaling the start of a content block in a streaming response
  */
 export interface ContentBlockStartEvent extends BaseEvent {
-  type: 'content_block_start';
+  type: 'content_block_start' & {};
   /** Index of the content block in the message.content array */
   index: number;
   /** Initial content block with metadata */
@@ -94,7 +113,7 @@ export interface ContentBlockStartEvent extends BaseEvent {
  * Event containing a delta update to a content block
  */
 export interface ContentBlockDeltaEvent extends BaseEvent {
-  type: 'content_block_delta';
+  type: 'content_block_delta' & {};
   /** Index of the content block being updated */
   index: number;
   /** The delta update to apply */
@@ -120,7 +139,7 @@ export interface ContentBlockDeltaEvent extends BaseEvent {
  * Event signaling the end of a content block
  */
 export interface ContentBlockStopEvent extends BaseEvent {
-  type: 'content_block_stop';
+  type: 'content_block_stop' & {};
   /** Index of the content block that has stopped */
   index: number;
   /** ISO timestamp when the content block stopped */
@@ -131,7 +150,7 @@ export interface ContentBlockStopEvent extends BaseEvent {
  * Event containing updates to the message's metadata
  */
 export interface MessageDeltaEvent extends BaseEvent {
-  type: 'message_delta';
+  type: 'message_delta' & {};
   /** Updates to the message object */
   delta: {
     /** Reason the message stopped generating (e.g., "end_turn", "stop_sequence", "max_tokens", "tool_use") */
@@ -150,11 +169,11 @@ export interface MessageDeltaEvent extends BaseEvent {
  * Event providing information about API usage limits
  */
 export interface MessageLimitEvent extends BaseEvent {
-  type: 'message_limit';
+  type: 'message_limit' & {};
   /** Information about API usage limits */
   message_limit: {
     /** Status of the limit: "within_limit", "approaching_limit", or "reached_limit" */
-    type: 'within_limit' | 'approaching_limit' | 'reached_limit';
+    type: 'within_limit' | 'approaching_limit' | ('reached_limit' & {});
     /** ISO timestamp when the limit resets */
     resetsAt: string | null;
     /** Number of remaining requests allowed */
@@ -168,7 +187,7 @@ export interface MessageLimitEvent extends BaseEvent {
  * Event signaling the end of the message stream
  */
 export interface MessageStopEvent extends BaseEvent {
-  type: 'message_stop';
+  type: 'message_stop' & {};
   /** Reason the message stopped (may be present) */
   stop_reason?: string;
 }
@@ -177,22 +196,13 @@ export interface MessageStopEvent extends BaseEvent {
  * Heartbeat event sent periodically during streaming
  * Used to keep connections alive and prevent timeouts
  */
-export interface PingEvent extends BaseEvent {
-  type: 'ping';
+export interface PingEvent extends ClientMessage {
+  type: 'ping' & {};
+  /** Ping payload */
+  content?: {
+    type: 'ping' & {};
+  };
 }
-
-/**
- * Union type of all possible Server-Sent Events (SSE)
- */
-export type SSEEvent =
-  | MessageStartEvent
-  | ContentBlockStartEvent
-  | ContentBlockDeltaEvent
-  | ContentBlockStopEvent
-  | MessageDeltaEvent
-  | MessageLimitEvent
-  | MessageStopEvent
-  | PingEvent;
 
 /**
  * Represents a chat conversation with Claude
@@ -439,62 +449,127 @@ export enum StopReason {
 /**
  * Event containing a list of conversations
  */
-export interface ConversationsEvent extends BaseEvent {
+export interface ConversationsEvent extends ClientMessage {
   type: 'conversations_list' & {};
   /** List of conversation data */
-  data: ChatConversation[];
+  content: {
+    type: 'conversations_list' & {};
+    data: ChatConversation[];
+  };
 }
 
 /**
  * Event containing details of a single conversation
  */
-export interface ConversationDetailEvent extends BaseEvent {
+export interface ConversationDetailEvent extends ClientMessage {
   type: 'conversation_detail' & {};
   /** Conversation data */
-  data: ChatConversation;
+  content: {
+    type: 'conversation_detail' & {};
+    data: ChatConversation;
+  };
 }
 
 /**
  * Event containing the latest messages in a conversation
  */
-export interface ConversationLatestEvent extends BaseEvent {
+export interface ConversationLatestEvent extends ClientMessage {
   type: 'conversation_latest' & {};
   /** Latest messages */
-  data: ChatMessage[];
+  content: {
+    type: 'conversation_latest' & {};
+    data: ChatMessage[];
+  };
 }
 
 /**
  * Event containing a conversation title update
  */
-export interface ConversationTitleEvent extends BaseEvent {
+export interface ConversationTitleEvent extends ClientMessage {
   type: 'conversation_title' & {};
   /** New title */
-  title: string;
+  content: {
+    type: 'conversation_title' & {};
+    title: string;
+  };
 }
 
 /**
  * Event containing a warning about a chat message
  */
-export interface ChatMessageWarningEvent extends BaseEvent {
+export interface ChatMessageWarningEvent extends ClientMessage {
   type: 'chat_message_warning' & {};
   /** Warning message */
-  data: string;
+  content: {
+    type: 'chat_message_warning' & {};
+    data: string;
+  };
 }
 
 /**
  * Event signaling a new conversation
  */
-export interface NewConversationEvent extends BaseEvent {
+export interface NewConversationEvent extends ClientMessage {
   type: 'new_conversation' & {};
   /** New conversation data */
-  data: ChatConversation;
+  content: {
+    type: 'new_conversation' & {};
+    data: ChatConversation;
+  };
+}
+
+/**
+ * Tab focus event - sent when a tab receives or loses focus
+ */
+export interface TabFocusEvent extends ClientMessage {
+  type: 'tab_focus' & {};
+  /** Focus information */
+  content: {
+    active: boolean;
+  };
+}
+
+/**
+ * Worker registration event - sent when a tab initializes
+ */
+export interface WorkerRegisterEvent extends ClientMessage {
+  type: 'worker_register' & {};
+  /** Registration information */
+  content: {
+    type: 'worker_register' & {};
+    clientId: string;
+    tabId: string;
+    isWorker: boolean; // Indicates if this is a /new tab
+    pathname: string;
+  };
+}
+
+/**
+ * Event sent when a tab updates its active conversation
+ */
+export interface WorkerUpdateActiveConversationEvent extends ClientMessage {
+  type: 'worker_update_active_conversation' & {};
+  /** Conversation update information */
+  content: {
+    type: 'worker_update_active_conversation' & {};
+    clientId: string;
+    tabId: string;
+    conversationId: string;
+  };
 }
 
 /**
  * Union type of all possible Claude API events
  */
 export type ClaudeEvent =
-  | SSEEvent
+  | MessageStartEvent
+  | ContentBlockStartEvent
+  | ContentBlockDeltaEvent
+  | ContentBlockStopEvent
+  | MessageDeltaEvent
+  | MessageLimitEvent
+  | MessageStopEvent
+  | PingEvent
   | ConversationsEvent
   | ConversationDetailEvent
   | ConversationLatestEvent
@@ -503,26 +578,26 @@ export type ClaudeEvent =
   | NewConversationEvent
   | NewChatRequest
   | WorkerRegisterEvent
-  | WorkerUpdateActiveConversationEvent;
+  | WorkerUpdateActiveConversationEvent
+  | TabFocusEvent
+  | ErrorEvent;
 
-export interface WorkerRegisterEvent extends BaseEvent {
-  type: 'worker_register';
-  /** Client ID */
-  clientId: string;
-  /** Tab ID */
-  tabId: string;
-  /** Is this a worker tab? */
-  isWorker: boolean;
-  /** Pathname of the tab */
-  pathname: string;
+export interface ErrorEvent extends BaseEvent {
+  type: 'error';
+  /** Error message */
+  content: {
+    type: 'error';
+    message: string;
+  };
 }
-
-export interface WorkerUpdateActiveConversationEvent extends BaseEvent {
-  type: 'worker_update_active_conversation';
-  /** Client ID */
-  clientId: string;
-  /** Tab ID */
-  tabId: string;
-  /** Conversation ID */
-  conversationId: string;
-}
+// Common payload structure for both frontend and backend
+export type Payload<T extends ClaudeEvent['type'] = any> = Extract<
+  ClaudeEvent,
+  { type: T }
+> & {
+  conversation_uuid?: string | null;
+  endpoint?: string;
+  url?: string;
+  tab_id?: string;
+  is_new_tab?: boolean;
+};

@@ -10,7 +10,6 @@ import type {
 } from 'openai/resources';
 
 import type {
-  SSEEvent,
   MessageStartEvent,
   ContentBlockDeltaEvent,
   ContentBlockStopEvent,
@@ -18,8 +17,10 @@ import type {
   MessageStopEvent,
   ContentBlockStartEvent,
   ClaudeEvent,
-  ChatMessage
+  ChatMessage,
+  Payload
 } from '../types/claude'; // Import the Claude types we defined
+import {} from 'ai';
 
 /**
  * Options for the Anthropic to OpenAI adapter
@@ -161,7 +162,9 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
       choices: [
         {
           index: 0,
+          logprobs: null,
           message: {
+            refusal: null,
             role: 'assistant',
             content: content,
             // Add tool_calls if thinking blocks exist
@@ -195,7 +198,9 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
    * @param event Event from Claude streaming API
    * @returns Converted event in OpenAI format, if applicable
    */
-  public processEvent(event: SSEEvent): ChatCompletionChunk | null {
+  public processEvent<T extends ClaudeEvent['type']>(
+    event: Payload<any>
+  ): ChatCompletionChunk | null {
     if (this.options.debug) {
       console.debug('Processing Claude event:', event.type);
     }
@@ -204,7 +209,7 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
 
     switch (event.type) {
       case 'message_start':
-        chunk = this.handleMessageStart(event as MessageStartEvent);
+        chunk = this.handleMessageStart(event);
         break;
       case 'content_block_start': {
         const startEvent = event as ContentBlockStartEvent;
@@ -242,11 +247,32 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
         break;
       }
       case 'message_delta':
+        console.log(event);
         chunk = this.handleMessageDelta(event as MessageDeltaEvent);
+
         break;
       case 'message_stop':
         chunk = this.handleMessageStop(event as MessageStopEvent);
         break;
+      case 'error': {
+        const errorPayload = event as Payload<'error'>;
+        const errorContent = errorPayload.content as any; // Or type more strictly
+
+        if (this.options.debug) {
+          console.error(
+            'Adapter: Encountered "error" event type, throwing enriched Error:',
+            JSON.stringify(errorContent)
+          );
+        }
+
+        const err = new Error(
+          errorContent?.message || 'Error event processed by adapter.',
+          { cause: JSON.stringify(errorContent) }
+        );
+
+        throw err;
+      }
+
       default:
         chunk = null;
     }
@@ -768,8 +794,8 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
       // Handle different stream types
       if (Symbol.asyncIterator in stream) {
         // If it's an AsyncIterable
-        for await (const event of stream as AsyncIterable<ClaudeEvent>) {
-          const chunk = this.processEvent(event as SSEEvent);
+        for await (const event of stream as AsyncIterable<Payload>) {
+          const chunk = this.processEvent(event);
           if (chunk) {
             this.emit('chunk', chunk);
           }
@@ -784,7 +810,7 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
           done = readerDone;
 
           if (!done && value) {
-            const event = JSON.parse(value) as SSEEvent;
+            const event = JSON.parse(value);
             const chunk = this.processEvent(event);
             if (chunk) {
               this.emit('chunk', chunk);
