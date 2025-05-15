@@ -120,10 +120,10 @@ export interface ContentBlockDeltaEvent extends BaseEvent {
   delta: {
     /** Type of delta: "text_delta" for text blocks, "input_json_delta" for tool_use blocks, or "thinking_delta" for thinking blocks */
     type:
-      | 'text_delta'
-      | 'input_json_delta'
-      | 'thinking_delta'
-      | 'signature_delta';
+    | 'text_delta'
+    | 'input_json_delta'
+    | 'thinking_delta'
+    | 'signature_delta';
     /** Text to append (for text_delta) */
     text?: string;
     /** Partial JSON to append (for input_json_delta) */
@@ -559,9 +559,9 @@ export interface WorkerUpdateActiveConversationEvent extends ClientMessage {
 }
 
 /**
- * Union type of all possible Claude API events
+ * Union type of SSE types
  */
-export type ClaudeEvent =
+export type SSEEvent =
   | MessageStartEvent
   | ContentBlockStartEvent
   | ContentBlockDeltaEvent
@@ -570,17 +570,35 @@ export type ClaudeEvent =
   | MessageLimitEvent
   | MessageStopEvent
   | PingEvent
+
+
+export type ClaudeApiEvent =
+  | MessageStartEvent
   | ConversationsEvent
   | ConversationDetailEvent
   | ConversationLatestEvent
   | ConversationTitleEvent
   | ChatMessageWarningEvent
+
+/**
+ * Union type of extension events
+ */
+export type ExtensionEvent =
+
   | NewConversationEvent
   | NewChatRequest
   | WorkerRegisterEvent
   | WorkerUpdateActiveConversationEvent
   | TabFocusEvent
   | ErrorEvent;
+
+/**
+ * Union type of all possible Claude API events
+ */
+export type ClaudeEvent =
+  | ClaudeApiEvent
+  | SSEEvent
+  | ExtensionEvent
 
 export interface ErrorEvent extends BaseEvent {
   type: 'error';

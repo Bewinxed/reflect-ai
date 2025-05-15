@@ -1,5 +1,13 @@
 import type {
+  ChatMessageWarningEvent,
+  ClaudeApiEvent,
   ClaudeEvent,
+  ConversationDetailEvent,
+  ConversationLatestEvent,
+  ConversationsEvent,
+  ConversationTitleEvent,
+  ExtensionEvent,
+  MessageStartEvent,
   NewChatRequest,
   Payload
   // Assuming ChatMessage is part of NewChatRequest['data']['chat_messages']
@@ -7,7 +15,7 @@ import type {
   // ChatMessage, (if you have a specific type for elements in chat_messages)
 } from '../../../types/claude'; // Adjust path as needed
 import { RiverSocketAdapter } from 'river.ts/websocket';
-import { events } from '../../../types/events';
+import { events, type Events, type RiverEventTypes } from '../../../types/events';
 
 // Define a basic ChatMessage type if not imported
 interface ChatMessage {
@@ -115,8 +123,7 @@ function registerTab(): void {
     ).length;
     debugLog(
       'TAB-REGISTRY',
-      `Active tabs: ${
-        Object.keys(tabRegistry).length
+      `Active tabs: ${Object.keys(tabRegistry).length
       }, New tabs: ${newTabCount}`
     );
   } catch (error) {
@@ -237,14 +244,14 @@ function disconnectWebSocket() {
   }
 }
 
-function sendToWebSocket<T extends ClaudeEvent['type']>(payload: Payload<T>) {
+function sendToWebSocket<T extends ClaudeEvent['type']>(payload: Events[T]['data']) {
   if (ws?.readyState === WebSocket.OPEN) {
-    const enhancedPayload = {
-      ...payload,
-      tab_id: tabInstanceId,
-      is_new_tab: isNewTabPage
-    };
-    ws.send(river.createMessage(payload.type, enhancedPayload));
+    payload.tab_id = tabInstanceId;
+    payload.is_new_tab = isNewTabPage;
+    payload.conversation_uuid = currentConversationId;
+    payload.url = window.location.href;
+    payload.endpoint = payload.endpoint || window.location.pathname.split('/').pop() || '';
+    ws.send(river.createMessage(payload.type, payload));
     debugLog('WS-SEND', `Sent ${payload.type} event`);
   } else {
     messageQueue.push(payload);
@@ -535,8 +542,7 @@ async function processChatMessagesOnPage(
   while ((!sendButton || sendButton.disabled) && retries < maxRetries) {
     debugLog(
       'BUTTON',
-      `Waiting for send button to be enabled (attempt ${
-        retries + 1
+      `Waiting for send button to be enabled (attempt ${retries + 1
       }/${maxRetries})`
     );
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -553,7 +559,14 @@ async function processChatMessagesOnPage(
     const errorMsg = 'Send button not found or is disabled after waiting';
     sendToWebSocket({
       type: 'error',
-      content: { type: 'error', message: errorMsg }
+      content: {
+        type: 'error', message: 'Send button not found or disabled after waiting'
+        , cause: {
+          status: 500,
+          statusText: 'Internal Server Error',
+          data: errorMsg
+        }
+      },
     });
     throw new Error(errorMsg);
   }
@@ -584,9 +597,13 @@ async function handleNewChatRequest(event: NewChatRequest): Promise<void> {
       type: 'error',
       content: {
         type: 'error',
-        message: `Failed to handle new chat request: ${
-          (error as Error).message
-        }`
+        message: `Failed to handle new chat request: ${(error as Error).message
+          }`,
+        cause: {
+          status: 500,
+          statusText: 'Internal Server Error',
+          data: error
+        }
       }
     }); // Do not re-throw here if error is sent to WebSocket, or make sure caller handles it
   }
@@ -606,169 +623,197 @@ function getPersistentTabInstanceId(): string {
 function interceptFetchAPI() {
   const originalFetch = window.fetch;
 
-  window.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
-    const url =
-      input instanceof URL
-        ? input
-        : new URL(
+  // Create a new function that preserves original properties
+  window.fetch = Object.assign(
+    async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      const url =
+        input instanceof URL
+          ? input
+          : new URL(
             typeof input === 'string' ? input : (input as Request).url,
             window.location.origin
           );
 
-    const urlConversationId = getConversationIdFromUrl(url);
-    if (urlConversationId) {
-      updateCurrentConversationId(urlConversationId);
-    }
+      const urlConversationId = getConversationIdFromUrl(url);
+      if (urlConversationId) {
+        updateCurrentConversationId(urlConversationId);
+      }
 
-    const modifiedUrl = addAuthIdToUrl(url);
-    const fetchInput =
-      input instanceof Request
-        ? new Request(modifiedUrl.href, { ...init, ...input }) // Spread init after input to allow overrides
-        : modifiedUrl.href;
+      const modifiedUrl = addAuthIdToUrl(url);
+      const fetchInput =
+        input instanceof Request
+          ? new Request(modifiedUrl.href, { ...init, ...input })
+          : modifiedUrl.href;
 
-    if (url.pathname.endsWith('count')) {
-      return originalFetch(fetchInput, init);
-    }
-    if (
-      url.pathname.includes('/api/organizations/') &&
-      url.pathname.includes('/chat_conversations')
-    ) {
-      try {
-        const response = await originalFetch(fetchInput, init);
-        const clonedResponse = response.clone();
-        const pathSegments = url.pathname.split('/');
-        const conversation_uuid = getConversationIdFromUrl(url); // Use consistent getter
+      // Skip interception for certain paths
+      if (url.pathname.endsWith('count')) {
+        return originalFetch(fetchInput, init);
+      }
 
-        if (!response.ok) {
-          let errorData = {
-            message: `API error: ${response.status} ${response.statusText}`
-          };
-          try {
-            const errorJson = await clonedResponse.json();
-            errorData = { ...errorData, ...errorJson };
-          } catch {
-            errorData.message = await clonedResponse.text(); // fallback to text
-          }
+      // Only intercept Claude API paths
+      if (url.pathname.includes('/api/organizations/') && url.pathname.includes('/chat_conversations')) {
+        try {
+          const response = await originalFetch(fetchInput, init);
+          const clonedResponse = response.clone();
+          const pathSegments = url.pathname.split('/');
+          const lastPathSegment = pathSegments.pop() || '';
+          const conversation_uuid = getConversationIdFromUrl(url);
 
-          sendToWebSocket({
-            type: 'error',
-            content: {
-              type: 'error',
-              message: `API Error: ${response.status} ${response.statusText}`,
-              details: {
-                status: response.status,
-                statusText: response.statusText,
-                data: errorData
-              }
-            },
-            conversation_uuid: conversation_uuid,
-            endpoint: pathSegments.pop() || '',
-            url: url.href
-          });
-          return response;
-        }
-
-        if (
-          url.pathname.endsWith('/completion') ||
-          url.pathname.endsWith('/retry_completion')
-        ) {
-          processStream(clonedResponse, url.href).catch((error) => {
-            debugLog(
-              'STREAM-ERROR',
-              'Failed to process stream from fetch',
-              error
-            );
-            // Error already sent within processStream
-          });
-          return response;
-        }
-
-        const contentType = response.headers.get('content-type');
-        if (contentType?.includes('application/json')) {
-          try {
-            const data = await clonedResponse.json();
-            const isCreatingNewConversation =
-              url.pathname.endsWith('/chat_conversations') &&
-              init?.method === 'POST';
-
-            if (
-              isCreatingNewConversation &&
-              response.status === 201 &&
-              data?.uuid
-            ) {
-              debugLog(
-                'NEW-CONV',
-                `New conversation created with ID: ${data.uuid}`
-              );
-              updateCurrentConversationId(data.uuid);
-            }
-
-            let eventType: Payload['type'] = '';
-            const lastPathSegment = pathSegments.pop() || '';
-
-            if (isCreatingNewConversation && response.status === 201) {
-              eventType = 'new_conversation';
-            } else if (
-              url.pathname.includes('/chat_conversations') &&
-              conversation_uuid &&
-              lastPathSegment === conversation_uuid &&
-              init?.method === 'GET' &&
-              response.status === 200
-            ) {
-              eventType = 'conversation_detail';
-            } else if (lastPathSegment === 'latest') {
-              eventType = 'conversation_latest';
-              return response; // Skip forwarding these for now
-            } else if (lastPathSegment === 'chat_message_warning') {
-              eventType = 'chat_message_warning';
-              return response; // Skip forwarding these
-            } else if (url.pathname.endsWith('/title')) {
-              eventType = 'conversation_title';
-            } else if (
-              url.pathname.endsWith('/chat_conversations') &&
-              init?.method === 'GET'
-            ) {
-              eventType = 'conversations_list';
+          // Handle error responses
+          if (!response.ok) {
+            let errorData = {
+              message: `API error: ${response.status} ${response.statusText}`
+            };
+            try {
+              const errorJson = await clonedResponse.json();
+              errorData = { ...errorData, ...errorJson };
+            } catch {
+              errorData.message = await clonedResponse.text();
             }
 
             sendToWebSocket({
-              type: eventType,
+              type: 'error',
               content: {
-                type: eventType, // Echo type in content for consistency
-                data: Array.isArray(data) ? data.slice(0, 10) : data // Limit array data if necessary
+                type: 'error',
+                message: `API Error: ${response.status} ${response.statusText}`,
+                cause: {
+                  status: response.status,
+                  statusText: response.statusText,
+                  data: errorData
+                }
               },
               conversation_uuid: conversation_uuid,
               endpoint: lastPathSegment,
               url: url.href
             });
-          } catch (error) {
-            debugLog('JSON-ERROR', 'Failed to process JSON response', {
-              error,
-              url: url.href
-            });
-            sendToWebSocket({
-              type: 'error',
-              content: {
-                type: 'error',
-                message: 'Failed to parse JSON response'
-              },
-              url: url.href
-            });
+            return response;
           }
+
+          // Handle streaming responses
+          if (url.pathname.endsWith('/completion') || url.pathname.endsWith('/retry_completion')) {
+            processStream(clonedResponse, url.href).catch((error) => {
+              debugLog('STREAM-ERROR', 'Failed to process stream from fetch', error);
+            });
+            return response;
+          }
+
+          // Handle JSON responses
+          const contentType = response.headers.get('content-type');
+          if (contentType?.includes('application/json')) {
+            try {
+              const data = await clonedResponse.json();
+
+              // Check for new conversation creation
+              const isCreatingNewConversation = url.pathname.endsWith('/chat_conversations') && init?.method === 'POST';
+              if (isCreatingNewConversation && response.status === 201 && !Array.isArray(data) && 'uuid' in data && data?.uuid) {
+                debugLog('NEW-CONV', `New conversation created with ID: ${data.uuid}`);
+                updateCurrentConversationId(data.uuid);
+              }
+
+              // Type-safe event handling based on URL patterns
+              if (isCreatingNewConversation && response.status === 201) {
+                sendToWebSocket({
+                  type: 'new_conversation',
+                  content: {
+                    type: 'new_conversation',
+                    data
+                  },
+                  conversation_uuid: conversation_uuid,
+                  endpoint: lastPathSegment,
+                  url: url.href
+                });
+              } else if (
+                url.pathname.includes('/chat_conversations') &&
+                conversation_uuid &&
+                lastPathSegment === conversation_uuid &&
+                init?.method === 'GET' &&
+                response.status === 200
+              ) {
+                sendToWebSocket({
+                  type: 'conversation_detail',
+                  content: {
+                    type: 'conversation_detail',
+                    data
+                  },
+                  conversation_uuid: conversation_uuid,
+                  endpoint: lastPathSegment,
+                  url: url.href
+                });
+              } else if (lastPathSegment === 'latest') {
+                // Skip forwarding these for now
+                return response;
+              } else if (lastPathSegment === 'chat_message_warning') {
+                // Skip forwarding these
+                return response;
+              } else if (url.pathname.endsWith('/title')) {
+                sendToWebSocket({
+                  type: 'conversation_title',
+                  content: {
+                    type: 'conversation_title',
+                    title: data.title
+                  },
+                  conversation_uuid: conversation_uuid,
+                  endpoint: lastPathSegment,
+                  url: url.href
+                });
+              } else if (
+                url.pathname.endsWith('/chat_conversations') &&
+                init?.method === 'GET'
+              ) {
+                sendToWebSocket({
+                  type: 'conversations_list',
+                  content: {
+                    type: 'conversations_list',
+                    data
+                  },
+                  conversation_uuid: conversation_uuid,
+                  endpoint: lastPathSegment,
+                  url: url.href
+                });
+              }
+            } catch (error) {
+              debugLog('JSON-ERROR', 'Failed to process JSON response', {
+                error,
+                url: url.href
+              });
+              sendToWebSocket({
+                type: 'error',
+                content: {
+                  type: 'error',
+                  message: 'Failed to parse JSON response',
+                  cause: {
+                    status: 500,
+                    statusText: 'Internal Server Error',
+                    data: error
+                  }
+                },
+                url: url.href
+              });
+            }
+          }
+          return response;
+        } catch (error) {
+          debugLog('FETCH-ERROR', 'API fetch error', { error, url: url.href });
+          sendToWebSocket({
+            type: 'error',
+            content: {
+              type: 'error',
+              message: (error as Error).message,
+              cause: {
+                status: 500,
+                statusText: 'Internal Server Error',
+                data: error
+              }
+            },
+            url: url.href
+          });
+          throw error;
         }
-        return response;
-      } catch (error) {
-        debugLog('FETCH-ERROR', 'API fetch error', { error, url: url.href });
-        sendToWebSocket({
-          type: 'error',
-          content: { type: 'error', message: (error as Error).message },
-          url: url.href
-        });
-        throw error; // Re-throw to ensure original fetch behavior on failure if not caught
       }
-    }
-    return originalFetch(fetchInput, init);
-  };
+      return originalFetch(fetchInput, init);
+    },
+    originalFetch
+  );
 }
 
 // Monitor URL changes
@@ -830,9 +875,13 @@ function initialize() {
                 type: 'error',
                 content: {
                   type: 'error',
-                  message: `Error processing stored new chat: ${
-                    (error as Error).message
-                  }`
+                  message: `Error processing stored new chat: ${(error as Error).message
+                    }`,
+                  cause: {
+                    status: 500,
+                    statusText: 'Internal Server Error',
+                    data: error
+                  }
                 }
               });
             }

@@ -1,8 +1,8 @@
-import { RiverEvents } from 'river.ts';
+import { RiverEvents, type EventMap } from 'river.ts';
 import { type Payload, type PingEvent } from './claude';
 
-export const events = new RiverEvents()
-  .defineEvent('ping', { data: {} as PingEvent })
+export const eventsMap = new RiverEvents()
+  .defineEvent('ping', { data: {} as Payload<'ping'> })
   .defineEvent('worker_register', {
     data: {} as Payload<'worker_register'>
   })
@@ -58,5 +58,8 @@ export const events = new RiverEvents()
   .defineEvent('error', {
     data: {} as Payload<'error'>
   })
-  // Add other event types as needed
-  .build();
+// Add other event types as needed
+
+export const events = eventsMap.build();
+export type Events = Omit<ReturnType<typeof eventsMap.build>, 'close' | 'open'>;
+export type RiverEventTypes = keyof Events;

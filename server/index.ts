@@ -1,7 +1,7 @@
 import type { ServerWebSocket } from 'bun';
 import diagnostics_channel from 'node:diagnostics_channel';
 import { EventEmitter } from 'node:events';
-import type { ChatCompletionMessageParam } from 'openai/resources.mjs';
+import type { ChatCompletion, ChatCompletionMessageParam } from 'openai/resources.mjs';
 import type {
   ClaudeEvent,
   MessageStartEvent,
@@ -65,9 +65,8 @@ function log(level: 'info' | 'warn' | 'error', message: string) {
   const levels = { error: 0, warn: 1, info: 2 };
   if (levels[level] <= levels[LOG_LEVEL]) {
     const timestamp = new Date().toISOString();
-    const formattedMessage = `${timestamp} ${
-      colors[level]
-    }[${level.toUpperCase()}]${colors.reset} ${message}`;
+    const formattedMessage = `${timestamp} ${colors[level]
+      }[${level.toUpperCase()}]${colors.reset} ${message}`;
     console.log(formattedMessage);
 
     // Publish to diagnostics channel
@@ -181,84 +180,83 @@ const server = Bun.serve<WebSocketData>({
         log('warn', `Tab disconnected: ${clientId}`);
       }
     },
+    // Modify the websocket message handler to include heartbeat updates and ensure all functionality is covered
     async message(ws, raw) {
       try {
-        const client = clients.get(ws.data.clientId);
+        const clientId = ws.data.clientId;
+        const client = clients.get(clientId);
+
         if (!client) {
-          log('error', `Message from unknown client: ${ws.data.clientId}`);
+          log('error', `Message from unknown client: ${clientId}`);
           return;
         }
+
+        // Update client's heartbeat time for any message received
+        client.lastHeartbeat = Date.now();
+
+        // Use River adapter to handle messages
         client.river.handleMessage(raw);
+
+        // Set up individual event type handlers
         client.river.on('ping', (data) => {
-          log('info', `Ping received from ${ws.data.clientId}`);
+          log('info', `Ping received from ${clientId}`);
           client.ws.send(client.river.createMessage('ping', data));
         });
+
         client.river.on('worker_register', (data) => {
-          const registerEvent = data;
-          // Update the client's isNewTab status based on content or top-level flag
-          client.isNewTab = data.content?.isWorker || false;
+          // Update the client's isNewTab status
+          client.isNewTab = data.content?.isWorker || !!data.is_new_tab;
 
           log(
             'info',
-            `Tab ${ws.data.clientId} registered as ${
-              client.isNewTab ? 'new tab' : 'conversation tab'
-            }`
+            `Tab ${clientId} registered as ${client.isNewTab ? 'new tab' : 'conversation tab'}`
           );
 
           // Log the number of /new tabs available
           const newTabs = [...clients.values()].filter((c) => c.isNewTab);
-          log(
-            'info',
-            `Total tabs: ${clients.size}, New tabs: ${newTabs.length}`
-          );
+          log('info', `Total tabs: ${clients.size}, New tabs: ${newTabs.length}`);
         });
+
         client.river.on('worker_update_active_conversation', (data) => {
-          // Update active conversation - use type assertion
-          // console.log(data);
           const convId = data.content?.conversationId;
 
           if (convId) {
             // If this was a /new tab, it's not anymore
             if (client.isNewTab) {
               client.isNewTab = false;
-              log(
-                'info',
-                `Tab ${ws.data.clientId} changed from /new to conversation: ${convId}`
-              );
+              log('info', `Tab ${clientId} changed from /new to conversation: ${convId}`);
             }
 
             // Update client state
             client.conversations.add(convId);
 
             // Map this conversation to this client
-            conversationToClient.set(convId, ws.data.clientId);
+            conversationToClient.set(convId, clientId);
 
-            log(
-              'info',
-              `Tab ${ws.data.clientId} active conversation: ${convId}`
-            );
+            log('info', `Tab ${clientId} active conversation: ${convId}`);
           }
         });
+
         client.river.on('tab_focus', (data) => {
-          // Tab focus event - use type assertion
           log(
             'info',
-            `Tab ${ws.data.clientId} focus changed: active=${data.content?.active}, isNewTab=${client.isNewTab}`
+            `Tab ${clientId} focus changed: active=${data.content?.active}, isNewTab=${client.isNewTab}`
           );
         });
+
         client.river.on('message_start', (data) => {
           // Process message start through adapter
           processAdapterEvent(ws, data);
 
           // Extract conversation ID from message
-          const convId =
-            data.conversation_uuid || data.message?.conversation_uuid;
+          const convId = data.conversation_uuid || data.message?.conversation_uuid;
 
           if (convId) {
             client.conversations.add(convId);
-            conversationToClient.set(convId, ws.data.clientId);
+            conversationToClient.set(convId, clientId);
           }
         });
+
         client.river.on('message_stop', (data) => {
           // Process message stop through adapter
           processAdapterEvent(ws, data);
@@ -271,53 +269,19 @@ const server = Bun.serve<WebSocketData>({
             delete ws.data.openaiRequestId;
           }
         });
-        client.river.on('content_block_start', (data) => {
-          // Process content block start through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('content_block_delta', (data) => {
-          // Process content block delta through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('content_block_stop', (data) => {
-          // Process content block stop through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('message_delta', (data) => {
-          // Process message delta through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('message_limit', (data) => {
-          // Process message limit through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('conversations_list', (data) => {
-          // Process conversations list through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('conversation_detail', (data) => {
-          // Process conversation detail through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('conversation_latest', (data) => {
-          // Process conversation latest through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('conversation_title', (data) => {
-          // Process conversation title through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('chat_message_warning', (data) => {
-          // Process chat message warning through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('new_conversation', (data) => {
-          // Process new conversation through adapter
-          processAdapterEvent(ws, data);
-        });
-        client.river.on('new_chat_request', (data) => {
-          // Process new chat request through adapter
-          processAdapterEvent(ws, data);
+
+        // Handle all other events through the adapter
+        const otherEventTypes = [
+          'content_block_start', 'content_block_delta', 'content_block_stop',
+          'message_delta', 'message_limit', 'conversations_list',
+          'conversation_detail', 'conversation_latest', 'conversation_title',
+          'chat_message_warning', 'new_conversation', 'new_chat_request'
+        ] as const
+
+        otherEventTypes.forEach(eventType => {
+          client.river.on(eventType, (data) => {
+            processAdapterEvent(ws, data);
+          });
         });
       } catch (error) {
         log('error', `Error handling message: ${error}`);
@@ -327,132 +291,7 @@ const server = Bun.serve<WebSocketData>({
   }
 });
 
-async function handleMessage(
-  ws: ServerWebSocket<WebSocketData>,
-  raw: string | Buffer
-) {
-  const clientId = ws.data.clientId;
-  let message: Payload;
 
-  try {
-    message = JSON.parse(raw.toString()) as Payload;
-
-    // Get client connection
-    const client = clients.get(clientId);
-    if (!client) {
-      log('error', `Message from unknown client: ${clientId}`);
-      return;
-    }
-
-    // Update client's last heartbeat time
-    client.lastHeartbeat = Date.now();
-
-    // Process different message types
-    switch (message.type) {
-      case 'ping': {
-        // Respond with pong
-        ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
-        break;
-      }
-
-      case 'worker_register': {
-        // Register the tab - use type assertion to access typed content
-        const registerEvent = message;
-
-        // Update the client's isNewTab status based on content or top-level flag
-        client.isNewTab =
-          message.is_new_tab || registerEvent.content?.isWorker || false;
-
-        log(
-          'info',
-          `Tab ${clientId} registered as ${
-            client.isNewTab ? 'new tab' : 'conversation tab'
-          }`
-        );
-
-        // Log the number of /new tabs available
-        const newTabs = [...clients.values()].filter((c) => c.isNewTab);
-        log('info', `Total tabs: ${clients.size}, New tabs: ${newTabs.length}`);
-        break;
-      }
-
-      case 'worker_update_active_conversation': {
-        // Update active conversation - use type assertion to access typed content
-        const updateEvent = message as WorkerUpdateActiveConversationEvent;
-        const convId = updateEvent.content?.conversationId;
-
-        if (convId) {
-          // If this was a /new tab, it's not anymore
-          if (client.isNewTab) {
-            client.isNewTab = false;
-            log(
-              'info',
-              `Tab ${clientId} changed from /new to conversation: ${convId}`
-            );
-          }
-
-          // Update client state
-          client.conversations.add(convId);
-
-          // Map this conversation to this client
-          conversationToClient.set(convId, clientId);
-
-          log('info', `Tab ${clientId} active conversation: ${convId}`);
-        }
-        break;
-      }
-
-      case 'tab_focus': {
-        // Tab focus event - use type assertion
-        const focusEvent = message as TabFocusEvent;
-        log(
-          'info',
-          `Tab ${clientId} focus changed: active=${focusEvent.content?.active}, isNewTab=${client.isNewTab}`
-        );
-        break;
-      }
-
-      case 'message_start': {
-        // Process message start through adapter
-        processAdapterEvent(ws, message);
-
-        // Extract conversation ID from message
-        const startEvent = message as MessageStartEvent;
-        const convId =
-          message.conversation_uuid || startEvent.message?.conversation_uuid;
-
-        if (convId) {
-          client.conversations.add(convId);
-          conversationToClient.set(convId, clientId);
-        }
-        break;
-      }
-
-      case 'message_stop': {
-        // Process message stop through adapter
-        processAdapterEvent(ws, message);
-
-        // Clean up adapter when message completes
-        const requestId = ws.data.openaiRequestId;
-        if (requestId) {
-          streamBridge.emit(`complete:${requestId}`);
-          ws.data.adapter = undefined;
-          delete ws.data.openaiRequestId;
-        }
-        break;
-      }
-
-      default: {
-        // Process all other message types through adapter
-        processAdapterEvent(ws, message);
-        break;
-      }
-    }
-  } catch (error) {
-    log('error', `Failed to parse message from ${clientId}: ${error}`);
-    throw error;
-  }
-}
 
 // Process events through the OpenAI adapter
 // In your server.ts (Bun server code)
@@ -478,7 +317,7 @@ function processAdapterEvent<T extends ClaudeEvent['type']>(
     // Catch any error thrown
 
     // Message was not JSON, treat as a generic error from the adapter (e.g., internal bug)
-    log('error', `${requestId}: ${error.message}`);
+    log('error', `${requestId}: ${(error as Error).message}`);
     streamBridge.emit(`error:${requestId}`, {
       message: (error as Error).message,
       type: 'adapter_internal_error', // Different type to distinguish
@@ -623,8 +462,8 @@ function createNewChatRequest(body: CompletionRequest): NewChatRequest {
                 msg.role === 'user'
                   ? 'Human: '
                   : msg.role === 'system'
-                  ? ''
-                  : 'Assistant: ';
+                    ? ''
+                    : 'Assistant: ';
               return `${prefix}${msg.content}`;
             })
             .join('\n\n')
@@ -749,6 +588,8 @@ async function createSynchronousResponse(
             {
               index: 0,
               message: {
+                refusal: null,
+
                 role: 'assistant',
                 content: fullContent.join('') // Combine all content chunks
               },
