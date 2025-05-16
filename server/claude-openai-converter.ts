@@ -1,13 +1,10 @@
-// src/claude-openai-converter.ts
+// server/claude-openai-converter.ts
 import { EventEmitter } from 'node:events';
 import type {
   ChatCompletionChunk,
-  ChatCompletionMessageParam,
   ChatCompletionRole,
-  ChatCompletion,
-  CompletionUsage,
-  CreateChatCompletionRequestMessage
-} from 'openai/resources';
+  ChatCompletion
+} from 'openai/resources.mjs';
 
 import type {
   MessageStartEvent,
@@ -19,8 +16,7 @@ import type {
   ClaudeEvent,
   ChatMessage,
   Payload
-} from '../types/claude'; // Import the Claude types we defined
-import {} from 'ai';
+} from '../types/claude'; // Uses your existing types
 
 /**
  * Options for the Anthropic to OpenAI adapter
@@ -49,10 +45,14 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
   private model: string | null = null;
   private created: number = Math.floor(Date.now() / 1000);
   private stopReason: string | null = null;
-  private usageInfo: CompletionUsage | null = null;
+  private usageInfo: any = null;
   private finishedBlocks: Set<number> = new Set();
   private startTime: number = Date.now();
   private blockTypes: Map<number, string> = new Map(); // Track block types
+  private toolCallIds: Map<number, string> = new Map(); // Track tool call IDs
+  private currentThinkingBlocks: Set<number> = new Set(); // Track active thinking blocks
+  private currentToolUseBlocks: Set<number> = new Set(); // Track active tool use blocks
+  private toolInputBuffers: Map<number, string> = new Map(); // Buffer for partial JSON
 
   /**
    * Create a new AnthropicToOpenAIAdapter
@@ -94,33 +94,6 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
   }
 
   /**
-   * Map Claude messages to OpenAI messages
-   * @param claudeMessages Messages in Claude format
-   * @returns Messages in OpenAI format
-   */
-  public mapMessages(
-    claudeMessages: ChatMessage[]
-  ): ChatCompletionMessageParam[] {
-    return claudeMessages.map((msg) => {
-      const baseMessage = {
-        role: this.mapRole(msg.sender),
-        content: msg.text
-      };
-
-      // Only function messages require the name property
-      if (baseMessage.role !== 'function') {
-        return baseMessage as ChatCompletionMessageParam;
-      } else {
-        // For function messages, add the required name property
-        return {
-          ...baseMessage,
-          name: 'default_function_name' // Replace with actual function name if available
-        } as ChatCompletionMessageParam;
-      }
-    });
-  }
-
-  /**
    * Reset the state of the adapter
    */
   private reset(): void {
@@ -132,65 +105,11 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
     this.usageInfo = null;
     this.finishedBlocks.clear();
     this.startTime = Date.now();
-  }
-
-  /**
-   * Convert Claude API response to an OpenAI Chat Completion response
-   * @param claudeResponse Response from Claude API
-   * @returns Response in OpenAI format
-   */
-  public convertToOpenAICompletion(claudeResponse: any): ChatCompletion {
-    // Extract text content from text blocks
-    const content = claudeResponse.content
-      .filter((block: any) => block.type === 'text')
-      .map((block: any) => block.text)
-      .join('');
-
-    // Find thinking blocks if any (for tool_calls)
-    const thinkingBlocks = claudeResponse.content.filter(
-      (block: any) => block.type === 'thinking'
-    );
-
-    // Create the base completion
-    const completion: ChatCompletion = {
-      id: claudeResponse.id,
-      object: 'chat.completion',
-      created: Math.floor(
-        new Date(claudeResponse.created_at || Date.now()).getTime() / 1000
-      ),
-      model: this.mapModel(claudeResponse.model),
-      choices: [
-        {
-          index: 0,
-          logprobs: null,
-          message: {
-            refusal: null,
-            role: 'assistant',
-            content: content,
-            // Add tool_calls if thinking blocks exist
-            ...(thinkingBlocks.length > 0 && {
-              tool_calls: thinkingBlocks.map((block: any, index: number) => ({
-                id: `call_thinking_${index}`,
-                type: 'function',
-                function: {
-                  name: 'thinking',
-                  arguments: JSON.stringify({ thoughts: block.thinking || '' })
-                }
-              }))
-            })
-          },
-          finish_reason:
-            this.mapStopReason(claudeResponse.stop_reason) || 'stop'
-        }
-      ],
-      usage: claudeResponse.usage || {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0
-      }
-    };
-
-    return completion;
+    this.blockTypes.clear();
+    this.toolCallIds.clear();
+    this.currentThinkingBlocks.clear();
+    this.currentToolUseBlocks.clear();
+    this.toolInputBuffers.clear();
   }
 
   /**
@@ -198,92 +117,89 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
    * @param event Event from Claude streaming API
    * @returns Converted event in OpenAI format, if applicable
    */
-  public processEvent<T extends ClaudeEvent['type']>(
-    event: Payload<any>
-  ): ChatCompletionChunk | null {
+  public processEvent(event: any): ChatCompletionChunk | null {
     if (this.options.debug) {
       console.debug('Processing Claude event:', event.type);
     }
 
     let chunk: ChatCompletionChunk | null = null;
 
-    switch (event.type) {
-      case 'message_start':
-        chunk = this.handleMessageStart(event);
-        break;
-      case 'content_block_start': {
-        const startEvent = event as ContentBlockStartEvent;
-        // Route to the appropriate handler based on content type
-        if (startEvent.content_block.type === 'thinking') {
-          chunk = this.handleThinkingBlockStart(startEvent);
-        } else {
-          chunk = this.handleContentBlockStart(startEvent);
+    try {
+      switch (event.type) {
+        case 'message_start':
+          chunk = this.handleMessageStart(event as MessageStartEvent);
+          break;
+        case 'content_block_start': {
+          const startEvent = event as ContentBlockStartEvent;
+          // Route to the appropriate handler based on content type
+          if (startEvent.content_block.type === 'thinking') {
+            chunk = this.handleThinkingBlockStart(startEvent);
+            this.currentThinkingBlocks.add(startEvent.index);
+          } else if (startEvent.content_block.type === 'tool_use') {
+            chunk = this.handleToolUseBlockStart(startEvent);
+            this.currentToolUseBlocks.add(startEvent.index);
+          } else {
+            chunk = this.handleContentBlockStart(startEvent);
+          }
+          break;
         }
-        break;
-      }
-      case 'content_block_delta': {
-        const deltaEvent = event as ContentBlockDeltaEvent;
-        // Route to the appropriate handler based on delta type
-        if (deltaEvent.delta.type === 'thinking_delta') {
-          chunk = this.handleThinkingDelta(deltaEvent);
-        } else if (
-          (deltaEvent.delta as any).type === 'thinking_summary_delta'
-        ) {
-          chunk = this.handleThinkingSummaryDelta(deltaEvent);
-        } else if (deltaEvent.delta.type === 'text_delta') {
-          chunk = this.handleContentBlockDelta(deltaEvent);
+        case 'content_block_delta': {
+          const deltaEvent = event as ContentBlockDeltaEvent;
+          // Route to the appropriate handler based on delta type
+          if (deltaEvent.delta.type === 'thinking_delta') {
+            chunk = this.handleThinkingDelta(deltaEvent);
+          } else if (deltaEvent.delta.type === 'text_delta') {
+            chunk = this.handleContentBlockDelta(deltaEvent);
+          } else if (deltaEvent.delta.type === 'input_json_delta') {
+            chunk = this.handleInputJsonDelta(deltaEvent);
+          }
+          break;
         }
-        break;
-      }
-      case 'content_block_stop': {
-        const stopEvent = event as ContentBlockStopEvent;
-        // Get the block type from our tracking
-        const blockType = this.blockTypes.get(stopEvent.index);
-        if (blockType === 'thinking') {
-          chunk = this.handleThinkingBlockStop(stopEvent);
-        } else {
-          chunk = this.handleContentBlockStop(stopEvent);
+        case 'content_block_stop': {
+          const stopEvent = event as ContentBlockStopEvent;
+          // Get the block type from our tracking
+          const blockType = this.blockTypes.get(stopEvent.index);
+
+          if (blockType === 'thinking') {
+            chunk = this.handleThinkingBlockStop(stopEvent);
+            this.currentThinkingBlocks.delete(stopEvent.index);
+          } else if (blockType === 'tool_use') {
+            chunk = this.handleToolUseBlockStop(stopEvent);
+            this.currentToolUseBlocks.delete(stopEvent.index);
+          } else {
+            chunk = this.handleContentBlockStop(stopEvent);
+          }
+
+          // Mark block as finished
+          this.finishedBlocks.add(stopEvent.index);
+          break;
         }
-        break;
-      }
-      case 'message_delta':
-        console.log(event);
-        chunk = this.handleMessageDelta(event as MessageDeltaEvent);
-
-        break;
-      case 'message_stop':
-        chunk = this.handleMessageStop(event as MessageStopEvent);
-        break;
-      case 'error': {
-        const errorPayload = event as Payload<'error'>;
-        const errorContent = errorPayload.content as any; // Or type more strictly
-
-        if (this.options.debug) {
-          console.error(
-            'Adapter: Encountered "error" event type, throwing enriched Error:',
-            JSON.stringify(errorContent)
-          );
+        case 'message_delta':
+          chunk = this.handleMessageDelta(event as MessageDeltaEvent);
+          break;
+        case 'message_stop':
+          chunk = this.handleMessageStop(event as MessageStopEvent);
+          break;
+        case 'error': {
+          const errorMessage = event.content?.message || 'Unknown error';
+          console.error('Adapter received error event:', errorMessage);
+          throw new Error(`Claude API error: ${errorMessage}`);
         }
-
-        const err = new Error(
-          errorContent?.message || 'Error event processed by adapter.',
-          { cause: JSON.stringify(errorContent) }
-        );
-
-        throw err;
+        default:
+          chunk = null;
       }
-
-      default:
-        chunk = null;
+    } catch (error) {
+      console.error('Error processing event:', error);
+      throw error;
     }
 
-    // IMPORTANT: If we have a chunk, emit the 'chunk' event
+    // If we have a chunk, emit the 'chunk' event
     if (chunk) {
       this.emit('chunk', chunk);
       if (this.options.debug) {
         console.debug(
           'Emitted chunk:',
-          JSON.stringify(chunk).substring(0, 100)
+          JSON.stringify(chunk).substring(0, 100) + '...'
         );
       }
     }
@@ -344,12 +260,14 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
     const { index, content_block } = event;
     const toolCallId = `call_thinking_${index}`;
 
+    // Store the tool call ID for later reference
+    this.toolCallIds.set(index, toolCallId);
+
     // Store the block type for later reference
     this.blockTypes.set(index, content_block.type);
 
     // Initialize thinking content from the content_block
-    // Note: content_block.thinking may not exist in the type definition
-    // so we need to access it safely
+    // Note: content_block.thinking is not in the interface but may be present
     const initialThinking = (content_block as any).thinking || '';
     this.accumulatedText.set(`thinking_${index}`, initialThinking);
 
@@ -370,8 +288,7 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
                 type: 'function',
                 function: {
                   name: 'thinking',
-                  arguments:
-                    '{"thoughts":"' + this.escapeJsonString(initialThinking)
+                  arguments: '{"thoughts":"' + this.escapeJsonString(initialThinking)
                 }
               }
             ]
@@ -393,12 +310,12 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
   ): ChatCompletionChunk | null {
     const { index, delta } = event;
 
-    // Check if it's a thinking delta (safely handle type differences)
+    // Check if it's a thinking delta
     if (delta.type !== 'thinking_delta' || !delta.thinking) {
       return null;
     }
 
-    const toolCallId = `call_thinking_${index}`;
+    const toolCallId = this.toolCallIds.get(index) || `call_thinking_${index}`;
 
     // Update accumulated thinking text
     const currentThinking = this.accumulatedText.get(`thinking_${index}`) || '';
@@ -432,43 +349,23 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
       ]
     };
 
-    if (chunk && chunk.choices[0].delta.tool_calls) {
-      console.log(
-        'THINKING TOOL CALL EMITTED:',
-        JSON.stringify(chunk.choices[0].delta.tool_calls[0])
-      );
-    }
-
     return chunk;
   }
 
   /**
-   * Handle thinking summary deltas
-   * These are special thinking deltas that contain summarized thinking
+   * Handle the end of a thinking content block
+   * @param event Content block stop event for a thinking block
    */
-  private handleThinkingSummaryDelta(
-    event: ContentBlockDeltaEvent
+  private handleThinkingBlockStop(
+    event: ContentBlockStopEvent
   ): ChatCompletionChunk | null {
-    const { index, delta } = event;
+    const { index } = event;
+    const toolCallId = this.toolCallIds.get(index) || `call_thinking_${index}`;
 
-    // Since TypeScript doesn't recognize thinking_summary_delta,
-    // we need to cast and access properties carefully
-    const summaryDelta = delta as any;
-    if (!summaryDelta.summary || !summaryDelta.summary.summary) {
-      return null;
-    }
+    // Close the JSON object for the arguments
+    const closingArguments = '"}';
 
-    const toolCallId = `call_thinking_${index}`;
-    const summaryText = `[SUMMARY: ${summaryDelta.summary.summary}]`;
-
-    // Update accumulated thinking text with the summary
-    const currentThinking = this.accumulatedText.get(`thinking_${index}`) || '';
-    this.accumulatedText.set(
-      `thinking_${index}`,
-      currentThinking + '\n' + summaryText
-    );
-
-    // Create a tool call delta chunk with the summary
+    // Create the final chunk that completes the tool call
     const chunk: ChatCompletionChunk = {
       id: this.messageId || `chatcmpl-${Date.now()}`,
       object: 'chat.completion.chunk',
@@ -483,7 +380,7 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
                 index: 0,
                 id: toolCallId,
                 function: {
-                  arguments: this.escapeJsonString('\n' + summaryText)
+                  arguments: closingArguments
                 }
               }
             ]
@@ -497,17 +394,139 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
   }
 
   /**
-   * Handle the end of a thinking content block
-   * @param event Content block stop event for a thinking block
+   * Handle the start of a tool_use content block
+   * @param event Content block start event with tool_use type
    */
-  private handleThinkingBlockStop(
+  private handleToolUseBlockStart(
+    event: ContentBlockStartEvent
+  ): ChatCompletionChunk | null {
+    const { index, content_block } = event;
+
+    // Generate a tool call ID if not provided
+    const toolCallId = content_block.id || `tool_call_${index}`;
+
+    // Store the tool call ID for later reference
+    this.toolCallIds.set(index, toolCallId);
+
+    // Store the block type for later reference
+    this.blockTypes.set(index, content_block.type);
+
+    // Get tool details
+    const toolName = content_block.name || '';
+
+    // Initialize tool input buffer
+    this.toolInputBuffers.set(index, '');
+
+    // Initial JSON if input is already available
+    let initialInput = '{}';
+    if (content_block.input && Object.keys(content_block.input).length > 0) {
+      try {
+        initialInput = JSON.stringify(content_block.input);
+        this.accumulatedText.set(`tool_input_${index}`, initialInput);
+      } catch (e) {
+        console.error('Error serializing initial tool input:', e);
+      }
+    }
+
+    // Create the initial tool call chunk
+    const chunk: ChatCompletionChunk = {
+      id: this.messageId || `chatcmpl-${Date.now()}`,
+      object: 'chat.completion.chunk',
+      created: this.created,
+      model: this.model || 'claude',
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: toolCallId,
+                type: 'function',
+                function: {
+                  name: toolName,
+                  arguments: '{' // Open the JSON object
+                }
+              }
+            ]
+          },
+          finish_reason: null
+        }
+      ]
+    };
+
+    return chunk;
+  }
+
+  /**
+   * Handle input_json_delta for tool use blocks
+   * @param event Content block delta event with input_json_delta type
+   */
+  private handleInputJsonDelta(
+    event: ContentBlockDeltaEvent
+  ): ChatCompletionChunk | null {
+    const { index, delta } = event;
+
+    // Check if it's an input json delta
+    if (delta.type !== 'input_json_delta' || !delta.partial_json) {
+      return null;
+    }
+
+    const toolCallId = this.toolCallIds.get(index) || `tool_call_${index}`;
+
+    // Update buffered JSON
+    const currentBuffer = this.toolInputBuffers.get(index) || '';
+    const newBuffer = currentBuffer + delta.partial_json;
+    this.toolInputBuffers.set(index, newBuffer);
+
+    // Try to parse what we have so far - this is just for tracking
+    try {
+      // Need to wrap with {} for parsing, but just stored in buffer
+      JSON.parse(`{${newBuffer}}`);
+    } catch (e) {
+      // This is fine - partial JSON doesn't need to be valid at every step
+    }
+
+    // Create a tool call delta chunk with the new input content
+    const chunk: ChatCompletionChunk = {
+      id: this.messageId || `chatcmpl-${Date.now()}`,
+      object: 'chat.completion.chunk',
+      created: this.created,
+      model: this.model || 'claude',
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: toolCallId,
+                function: {
+                  arguments: delta.partial_json
+                }
+              }
+            ]
+          },
+          finish_reason: null
+        }
+      ]
+    };
+
+    return chunk;
+  }
+
+  /**
+   * Handle the end of a tool_use content block
+   * @param event Content block stop event for a tool_use block
+   */
+  private handleToolUseBlockStop(
     event: ContentBlockStopEvent
   ): ChatCompletionChunk | null {
     const { index } = event;
-    const toolCallId = `call_thinking_${index}`;
+    const toolCallId = this.toolCallIds.get(index) || `tool_call_${index}`;
 
-    // Close the JSON object for the arguments
-    const closingArguments = '"}';
+    // Close the JSON object
+    const closingArguments = '}';
 
     // Create the final chunk that completes the tool call
     const chunk: ChatCompletionChunk = {
@@ -545,7 +564,6 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
   private handleMessageStart(event: MessageStartEvent): ChatCompletionChunk {
     // Reset the state for new message
     this.reset();
-    this.initializeBlockTracking();
 
     this.messageId = event.message.id;
     this.model = this.mapModel(event.message.model);
@@ -651,16 +669,6 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
   }
 
   /**
-   * Initialize block tracking during message_start event
-   * This ensures we start clean with each new message
-   */
-  private initializeBlockTracking(): void {
-    this.blockTypes.clear();
-    this.accumulatedText.clear();
-    this.finishedBlocks.clear();
-  }
-
-  /**
    * Handle the end of a content block
    * @param event Content block stop event
    * @returns OpenAI compatible chunk or null
@@ -709,6 +717,26 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
     // Map to one of the specific finish reasons OpenAI allows
     const finishReason = this.mapStopReason(this.stopReason);
 
+    // Check if any thinking or tool use blocks are still active
+    const hasUnfinishedThinkingBlocks = this.currentThinkingBlocks.size > 0;
+    const hasUnfinishedToolUseBlocks = this.currentToolUseBlocks.size > 0;
+
+    // If there are unfinished blocks, we need to close them
+    if (hasUnfinishedThinkingBlocks || hasUnfinishedToolUseBlocks) {
+      for (const index of this.currentThinkingBlocks) {
+        this.handleThinkingBlockStop({ type: 'content_block_stop', index, stop_timestamp: new Date().toISOString() });
+      }
+
+      for (const index of this.currentToolUseBlocks) {
+        this.handleToolUseBlockStop({ type: 'content_block_stop', index, stop_timestamp: new Date().toISOString() });
+      }
+    }
+
+    // Final finish reason should be tool_calls if we were using tools
+    const finalFinishReason = hasUnfinishedToolUseBlocks
+      ? 'tool_calls'
+      : (this.stopReason === 'tool_use' ? 'tool_calls' : finishReason);
+
     // Emit final chunk with finish reason
     return {
       id: this.messageId || `chatcmpl-${Date.now()}`,
@@ -719,7 +747,7 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
         {
           index: 0,
           delta: {},
-          finish_reason: finishReason
+          finish_reason: finalFinishReason
         }
       ],
       usage: this.usageInfo
@@ -727,373 +755,91 @@ export class AnthropicToOpenAIAdapter extends EventEmitter {
   }
 
   /**
-   * Convert Anthropic Messages API request to OpenAI Chat Completion request
-   * Handles the different message types correctly
+   * Convert a complete Claude message to an OpenAI formatted completion
+   * Used for non-streaming responses
    */
-  public convertAnthropicToOpenAIRequest(anthropicRequest: any): any {
-    const messages: ChatCompletionMessageParam[] = [];
+  public convertToOpenAICompletion(message: any): ChatCompletion {
+    // Extract text content blocks
+    const textContent = message.content
+      ?.filter((block: any) => block.type === 'text')
+      .map((block: any) => block.text || '')
+      .join('') || '';
 
-    // Add system prompt if provided
-    if (anthropicRequest.system) {
-      messages.push({
-        role: 'system',
-        content: anthropicRequest.system
-      } as ChatCompletionMessageParam);
-    }
+    // Extract thinking blocks
+    const thinkingBlocks = message.content
+      ?.filter((block: any) => block.type === 'thinking') || [];
 
-    // Add user and assistant messages
-    if (Array.isArray(anthropicRequest.messages)) {
-      anthropicRequest.messages.forEach((msg: any) => {
-        const role = this.mapRole(msg.role);
-        const content =
-          typeof msg.content === 'string'
-            ? msg.content
-            : msg.content.map((c: any) => c.text).join('');
+    // Extract tool use blocks
+    const toolUseBlocks = message.content
+      ?.filter((block: any) => block.type === 'tool_use') || [];
 
-        if (role === 'function') {
-          // Function messages require a name
-          messages.push({
-            role,
-            content,
-            name: msg.name || 'default_function_name'
-          } as ChatCompletionMessageParam);
-        } else {
-          // Other message types
-          messages.push({
-            role,
-            content
-          } as ChatCompletionMessageParam);
-        }
-      });
-    }
-
-    // Create the OpenAI request object without attaching to ChatCompletionMessageParam directly
-    const openAIRequest: any = {
-      model: this.mapModel(anthropicRequest.model),
-      messages,
-      stream: anthropicRequest.stream,
-      max_tokens: anthropicRequest.max_tokens,
-      temperature: anthropicRequest.temperature,
-      top_p: anthropicRequest.top_p
+    // Default usage if not provided
+    const usage = {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0
     };
 
-    return openAIRequest;
-  }
-
-  /**
-   * Process a Claude API stream and emit OpenAI-compatible events
-   * @param stream Anthropic SSE stream
-   */
-  public async processStream(
-    stream: ReadableStream<any> | AsyncIterable<ClaudeEvent>
-  ): Promise<void> {
-    try {
-      // Reset state for new stream
-      this.reset();
-
-      // Handle different stream types
-      if (Symbol.asyncIterator in stream) {
-        // If it's an AsyncIterable
-        for await (const event of stream as AsyncIterable<Payload>) {
-          const chunk = this.processEvent(event);
-          if (chunk) {
-            this.emit('chunk', chunk);
-          }
-        }
-      } else {
-        // If it's a ReadableStream
-        const reader = (stream as ReadableStream<any>).getReader();
-        let done = false;
-
-        while (!done) {
-          const { value, done: readerDone } = await reader.read();
-          done = readerDone;
-
-          if (!done && value) {
-            const event = JSON.parse(value);
-            const chunk = this.processEvent(event);
-            if (chunk) {
-              this.emit('chunk', chunk);
-            }
-          }
-        }
-      }
-
-      // Emit a complete event when done
-      this.emit('complete', {
-        id: this.messageId || `chatcmpl-${Date.now()}`,
-        created: this.created,
-        model: this.model || 'claude',
-        object: 'chat.completion',
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: Array.from(this.accumulatedText.values()).join('')
-            },
-            finish_reason: this.mapStopReason(this.stopReason)
-          }
-        ],
-        usage: this.usageInfo
-      });
-    } catch (error) {
-      this.emit('error', error);
+    // If we have usage information, use it
+    if (message.usage) {
+      usage.completion_tokens = message.usage.output_tokens || 0;
+      usage.total_tokens = message.usage.output_tokens || 0;
     }
-  }
 
-  /**
-   * Create an async iterable that yields OpenAI compatible chunks from a Claude stream
-   * @param stream Anthropic SSE stream
-   * @returns AsyncIterable of OpenAI compatible chunks
-   */
-  public async *createOpenAICompatibleStream(
-    stream: ReadableStream<any> | AsyncIterable<ClaudeEvent>
-  ): AsyncIterable<ChatCompletionChunk> {
-    // Create a promise that will resolve/reject based on events
-    let resolveNextChunk: ((chunk: ChatCompletionChunk) => void) | null = null;
-    let rejectNextChunk: ((error: Error) => void) | null = null;
+    // Determine finish reason
+    const finishReason = this.mapStopReason(message.stop_reason) || 'stop';
+    const hasToolUse = toolUseBlocks.length > 0;
+    const finalFinishReason = hasToolUse ? 'tool_calls' : finishReason;
 
-    // Set up event listeners
-    const getNextChunk = () => {
-      return new Promise<ChatCompletionChunk>((resolve, reject) => {
-        resolveNextChunk = resolve;
-        rejectNextChunk = reject;
-      });
+    // Build the completion
+    const completion: ChatCompletion = {
+      id: message.id || `chatcmpl-${Date.now()}`,
+      object: 'chat.completion',
+      created: Math.floor(new Date().getTime() / 1000),
+      model: this.mapModel(message.model || 'claude'),
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: textContent,
+          },
+          finish_reason: finalFinishReason,
+          logprobs: null
+        }
+      ],
+      usage
     };
 
-    // Handle events
-    this.on('chunk', (chunk) => {
-      if (resolveNextChunk) {
-        resolveNextChunk(chunk);
-        resolveNextChunk = null;
-      }
-    });
+    // Add tool_calls if needed
+    if (thinkingBlocks.length > 0 || toolUseBlocks.length > 0) {
+      completion.choices[0].message.tool_calls = [];
 
-    this.on('error', (error) => {
-      if (rejectNextChunk) {
-        rejectNextChunk(error);
-        rejectNextChunk = null;
-      }
-    });
-
-    // Start processing the stream
-    this.processStream(stream).catch((error) => {
-      if (rejectNextChunk) {
-        rejectNextChunk(error);
-      }
-    });
-
-    try {
-      // Yield chunks as they arrive
-      while (true) {
-        const chunk = await getNextChunk();
-        yield chunk;
-
-        // If this is the final chunk with a finish_reason, stop
-        if (chunk.choices[0].finish_reason) {
-          break;
-        }
-      }
-    } finally {
-      // Clean up event listeners
-      this.removeAllListeners('chunk');
-      this.removeAllListeners('error');
-    }
-  }
-}
-
-/**
- * Helper class to handle Anthropic streaming events and convert them to OpenAI format
- * This is a simpler version without the full adapter functionality
- */
-export class AnthropicStreamProcessor {
-  private buffer: string = '';
-  private currentMessageId: string | null = null;
-  private currentModel: string | null = null;
-  private created: number = Date.now();
-
-  /**
-   * Process a single line from the SSE stream and convert to OpenAI format if applicable
-   * @param line A line from the SSE stream
-   * @returns OpenAI-compatible chunk or null if not applicable
-   */
-  public processLine(line: string): ChatCompletionChunk | null {
-    // Skip empty lines or comments
-    if (!line || line.trim() === '' || line.startsWith(':')) {
-      return null;
-    }
-
-    // Handle SSE format
-    if (line.startsWith('data: ')) {
-      const data = line.slice(6); // Remove 'data: ' prefix
-
-      // Handle end of stream
-      if (data === '[DONE]') {
-        return {
-          id: this.currentMessageId || `chatcmpl-${Date.now()}`,
-          object: 'chat.completion.chunk',
-          created: Math.floor(this.created / 1000),
-          model: this.currentModel || 'claude',
-          choices: [
-            {
-              index: 0,
-              delta: {},
-              finish_reason: 'stop'
-            }
-          ]
-        };
-      }
-
-      try {
-        const event = JSON.parse(data);
-        return this.processEvent(event);
-      } catch (error) {
-        console.error('Error parsing JSON from SSE:', error);
-        return null;
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Process a raw event object from the Anthropic API
-   * @param event Event object from Anthropic
-   * @returns OpenAI-compatible chunk or null if not applicable
-   */
-  private processEvent(event: any): ChatCompletionChunk | null {
-    const eventType = event.type;
-
-    switch (eventType) {
-      case 'message_start': {
-        this.currentMessageId = event.message.id;
-        this.currentModel = event.message.model;
-        this.created = Date.now();
-
-        return {
-          id: this.currentMessageId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(this.created / 1000),
-          model: this.currentModel,
-          choices: [
-            {
-              index: 0,
-              delta: {
-                role: 'assistant',
-                content: ''
-              },
-              finish_reason: null
-            }
-          ]
-        };
-      }
-
-      case 'content_block_delta': {
-        // Only handle text deltas
-        if (event.delta.type === 'text_delta' && event.delta.text) {
-          this.buffer += event.delta.text;
-
-          return {
-            id: this.currentMessageId || `chatcmpl-${Date.now()}`,
-            object: 'chat.completion.chunk',
-            created: Math.floor(this.created / 1000),
-            model: this.currentModel || 'claude',
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  content: event.delta.text
-                },
-                finish_reason: null
-              }
-            ]
-          };
-        }
-        return null;
-      }
-
-      case 'message_stop': {
-        return {
-          id: this.currentMessageId || `chatcmpl-${Date.now()}`,
-          object: 'chat.completion.chunk',
-          created: Math.floor(this.created / 1000),
-          model: this.currentModel || 'claude',
-          choices: [
-            {
-              index: 0,
-              delta: {},
-              finish_reason: 'stop'
-            }
-          ]
-        };
-      }
-
-      default:
-        return null;
-    }
-  }
-
-  /**
-   * Process a complete Anthropic SSE stream and convert to OpenAI compatible chunks
-   * @param stream Readable or AsyncIterable containing SSE events
-   * @returns AsyncIterable of OpenAI compatible chunks
-   */
-  public async *processStream(
-    stream: ReadableStream<any> | AsyncIterable<string>
-  ): AsyncGenerator<ChatCompletionChunk> {
-    try {
-      // Reset state
-      this.buffer = '';
-      this.currentMessageId = null;
-      this.currentModel = null;
-      this.created = Date.now();
-
-      if (Symbol.asyncIterator in stream) {
-        // Handle AsyncIterable
-        for await (const chunk of stream as AsyncIterable<string>) {
-          const lines = chunk.toString().split('\n');
-
-          for (const line of lines) {
-            const result = this.processLine(line);
-            if (result) {
-              yield result;
-            }
+      // Add thinking blocks as tool calls
+      thinkingBlocks.forEach((block: any, idx: number) => {
+        completion.choices[0].message.tool_calls!.push({
+          id: block.id || `thinking_${idx}`,
+          type: 'function',
+          function: {
+            name: 'thinking',
+            arguments: JSON.stringify({ thoughts: block.thinking || '' })
           }
-        }
-      } else {
-        // Handle ReadableStream
-        const reader = (stream as ReadableStream<any>).getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
+        });
+      });
 
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || ''; // Keep the last incomplete line in the buffer
-
-          for (const line of lines) {
-            const result = this.processLine(line);
-            if (result) {
-              yield result;
-            }
+      // Add tool use blocks as tool calls
+      toolUseBlocks.forEach((block: any, idx: number) => {
+        completion.choices[0].message.tool_calls!.push({
+          id: block.id || `tool_${idx}`,
+          type: 'function',
+          function: {
+            name: block.name || 'unknown_tool',
+            arguments: JSON.stringify(block.input || {})
           }
-        }
-
-        // Process any remaining data
-        if (buffer) {
-          const result = this.processLine(buffer);
-          if (result) {
-            yield result;
-          }
-        }
-      }
-    } catch (error) {
-      console.error('Error processing Anthropic stream:', error);
-      throw error;
+        });
+      });
     }
+
+    return completion;
   }
 }

@@ -152,17 +152,103 @@ const server = Bun.serve<WebSocketData>({
       const clientId = ws.data.clientId;
       const now = Date.now();
 
-      // Initialize the client connection
-      clients.set(clientId, {
+      const client = {
         ws,
-        conversations: new Set(),
+        conversations: new Set<string>(),
         isNewTab: false, // Will be updated when client sends worker_register
         lastHeartbeat: now,
         river: new RiverSocketAdapter(events)
-      });
+      }
+      // Initialize the client connection
+      clients.set(clientId, client);
 
       log('info', `Tab connected: ${clientId}`);
-      ws.ping();
+      // Set up individual event type handlers
+      client.river.on('ping', (data) => {
+        log('info', `Ping received from ${clientId}`);
+        client.ws.send(client.river.createMessage('ping', data));
+      });
+
+      client.river.on('worker_register', (data) => {
+        // Update the client's isNewTab status
+        client.isNewTab = data.content?.isWorker || !!data.is_new_tab;
+
+        log(
+          'info',
+          `Tab ${clientId} registered as ${client.isNewTab ? 'new tab' : 'conversation tab'}`
+        );
+
+        // Log the number of /new tabs available
+        const newTabs = [...clients.values()].filter((c) => c.isNewTab);
+        log('info', `Total tabs: ${clients.size}, New tabs: ${newTabs.length}`);
+      });
+
+      client.river.on('worker_update_active_conversation', (data) => {
+        const convId = data.content?.conversationId;
+
+        if (convId) {
+          // If this was a /new tab, it's not anymore
+          if (client.isNewTab) {
+            client.isNewTab = false;
+            log('info', `Tab ${clientId} changed from /new to conversation: ${convId}`);
+          }
+
+          // Update client state
+          client.conversations.add(convId);
+
+          // Map this conversation to this client
+          conversationToClient.set(convId, clientId);
+
+          log('info', `Tab ${clientId} active conversation: ${convId}`);
+        }
+      });
+
+      client.river.on('tab_focus', (data) => {
+        log(
+          'info',
+          `Tab ${clientId} focus changed: active=${data.content?.active}, isNewTab=${client.isNewTab}`
+        );
+      });
+
+      client.river.on('message_start', (data) => {
+        // Process message start through adapter
+        processAdapterEvent(ws, data);
+
+        // Extract conversation ID from message
+        const convId = data.conversation_uuid || data.message?.conversation_uuid;
+
+        if (convId) {
+          client.conversations.add(convId);
+          conversationToClient.set(convId, clientId);
+        }
+      });
+
+      client.river.on('message_stop', (data) => {
+        // Process message stop through adapter
+        processAdapterEvent(ws, data);
+
+        // Clean up adapter when message completes
+        const requestId = ws.data.openaiRequestId;
+        if (requestId) {
+          streamBridge.emit(`complete:${requestId}`);
+          ws.data.adapter = undefined;
+          delete ws.data.openaiRequestId;
+        }
+      });
+
+      // Handle all other events through the adapter
+      const otherEventTypes = [
+        'content_block_start', 'content_block_delta', 'content_block_stop',
+        'message_delta', 'message_limit', 'conversations_list',
+        'conversation_detail', 'conversation_latest', 'conversation_title',
+        'chat_message_warning', 'new_conversation', 'new_chat_request'
+      ] as const
+
+      otherEventTypes.forEach(eventType => {
+        client.river.on(eventType, (data) => {
+          processAdapterEvent(ws, data);
+        });
+      });
     },
     async close(ws) {
       const clientId = ws.data.clientId;
@@ -194,95 +280,12 @@ const server = Bun.serve<WebSocketData>({
         // Update client's heartbeat time for any message received
         client.lastHeartbeat = Date.now();
 
+        console.log(JSON.parse(raw).data.type);
+
         // Use River adapter to handle messages
         client.river.handleMessage(raw);
 
-        // Set up individual event type handlers
-        client.river.on('ping', (data) => {
-          log('info', `Ping received from ${clientId}`);
-          client.ws.send(client.river.createMessage('ping', data));
-        });
 
-        client.river.on('worker_register', (data) => {
-          // Update the client's isNewTab status
-          client.isNewTab = data.content?.isWorker || !!data.is_new_tab;
-
-          log(
-            'info',
-            `Tab ${clientId} registered as ${client.isNewTab ? 'new tab' : 'conversation tab'}`
-          );
-
-          // Log the number of /new tabs available
-          const newTabs = [...clients.values()].filter((c) => c.isNewTab);
-          log('info', `Total tabs: ${clients.size}, New tabs: ${newTabs.length}`);
-        });
-
-        client.river.on('worker_update_active_conversation', (data) => {
-          const convId = data.content?.conversationId;
-
-          if (convId) {
-            // If this was a /new tab, it's not anymore
-            if (client.isNewTab) {
-              client.isNewTab = false;
-              log('info', `Tab ${clientId} changed from /new to conversation: ${convId}`);
-            }
-
-            // Update client state
-            client.conversations.add(convId);
-
-            // Map this conversation to this client
-            conversationToClient.set(convId, clientId);
-
-            log('info', `Tab ${clientId} active conversation: ${convId}`);
-          }
-        });
-
-        client.river.on('tab_focus', (data) => {
-          log(
-            'info',
-            `Tab ${clientId} focus changed: active=${data.content?.active}, isNewTab=${client.isNewTab}`
-          );
-        });
-
-        client.river.on('message_start', (data) => {
-          // Process message start through adapter
-          processAdapterEvent(ws, data);
-
-          // Extract conversation ID from message
-          const convId = data.conversation_uuid || data.message?.conversation_uuid;
-
-          if (convId) {
-            client.conversations.add(convId);
-            conversationToClient.set(convId, clientId);
-          }
-        });
-
-        client.river.on('message_stop', (data) => {
-          // Process message stop through adapter
-          processAdapterEvent(ws, data);
-
-          // Clean up adapter when message completes
-          const requestId = ws.data.openaiRequestId;
-          if (requestId) {
-            streamBridge.emit(`complete:${requestId}`);
-            ws.data.adapter = undefined;
-            delete ws.data.openaiRequestId;
-          }
-        });
-
-        // Handle all other events through the adapter
-        const otherEventTypes = [
-          'content_block_start', 'content_block_delta', 'content_block_stop',
-          'message_delta', 'message_limit', 'conversations_list',
-          'conversation_detail', 'conversation_latest', 'conversation_title',
-          'chat_message_warning', 'new_conversation', 'new_chat_request'
-        ] as const
-
-        otherEventTypes.forEach(eventType => {
-          client.river.on(eventType, (data) => {
-            processAdapterEvent(ws, data);
-          });
-        });
       } catch (error) {
         log('error', `Error handling message: ${error}`);
         throw error;
@@ -329,6 +332,7 @@ function processAdapterEvent<T extends ClaudeEvent['type']>(
 
 async function handleCompletionsRequest(req: Request): Promise<Response> {
   const start = performance.now();
+  console.log("hi")
 
   try {
     const url = new URL(req.url);
